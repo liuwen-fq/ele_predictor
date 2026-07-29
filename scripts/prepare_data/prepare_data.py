@@ -24,6 +24,12 @@ from formula_design.utils import setup_default_logging
 
 logger = setup_default_logging()
 
+MONO_PRETRAIN_PROPERTIES = [
+    "Tm", "bp", "pka_a", "pka_b", "nD", "nD_T", "nD_liquid", "nD_liquid_T",
+    "ST", "ST_T", "density", "density_T", "vis", "vis_T", "vapP", "vapP_T",
+    "dc", "dc_T"
+]
+
 parser = argparse.ArgumentParser(description="process data and save to pkl")
 parser.add_argument("--conf", type=str, help='config yaml file')
 parser.add_argument("--num_workers",
@@ -99,6 +105,15 @@ def preprocessing_mono(config):
     with open(config._config['json_path'], "r") as f:
         data = json.load(f)
 
+    task = config.get('task')
+    if task not in {"pretrain", "inference"}:
+        raise ValueError(
+            "mono preprocessing requires task: pretrain or task: inference "
+            "in the dataset configuration")
+    if not data:
+        raise ValueError("mono preprocessing input is empty")
+
+    os.makedirs(config._config['save_dir'], exist_ok=True)
     for molecule in data:
 
         assert "name" in molecule
@@ -109,17 +124,30 @@ def preprocessing_mono(config):
         else:
             raise ValueError(f"Missing smiles for {molecule['name']}")
 
-        assert "temperature" in molecule
-        ## Normalization
-        # The original unit of temperature is celsius
-        molecule['temperature'] = (molecule['temperature'] + 273.15) / 373.15
-        if not os.path.exists(config._config['save_dir']):
-            os.makedirs(config._config['save_dir'])
+    if task == "inference":
+        # Inference records specify one measurement temperature in Celsius.
+        for molecule in data:
+            if "temperature" not in molecule:
+                raise ValueError(f"Missing temperature for inference molecule "
+                                 f"{molecule['name']}")
+            molecule['temperature'] = (molecule['temperature'] +
+                                       273.15) / 373.15
+    elif task == "pretrain":
+        # mono_data.json stores labels and property-specific temperatures.
+        for molecule in data:
+            missing = [
+                prop for prop in MONO_PRETRAIN_PROPERTIES
+                if prop not in molecule
+            ]
+            if missing:
+                raise ValueError(
+                    f"Missing pretraining fields for {molecule['name']}: "
+                    f"{', '.join(missing)}")
+        data = normalize_entries(data, MONO_PRETRAIN_PROPERTIES, config)
 
-        with open(
-                os.path.join(config._config['save_dir'],
-                             "processed_data.json"), "w") as f:
-            json.dump(data, f, indent=4)
+    with open(os.path.join(config._config['save_dir'], "processed_data.json"),
+              "w") as f:
+        json.dump(data, f, indent=4)
 
     return config
 

@@ -1,11 +1,11 @@
-ckpt_path: "<path to the checkpoint folder>"
-output_dir: "<path to your output folder>"
+ckpt_path: "ckpts/generator"
+output_dir: "run/generator"
 num_batch: 2
 batch_size: 128
 temperature: 25
 concentration: 0.1
-conductivities: [5.0, 10.0, 30.0]
-anion_ratios: [0.3, 0.5, 0.7]
+conductivities: [10.0]
+anion_ratios: [0.7]
 
 diffusion_config:
   model_config:

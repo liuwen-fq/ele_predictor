@@ -22,12 +22,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from formula_design.fragment import build_fragment_graph
 from formula_design.mol import Molecule, MoleculeGraph
 from formula_design.utils.definitions import (ELEMENT_MAP, MAX_RING_SIZE,
                                               BondOrder)
 from formula_design.utils.mol_utils import find_equivalent_index, get_ring_info
 
-_count_names = ['node', 'edge']
+_count_names = ['node', 'edge', 'fragment']
 _count_idx = {name: idx for idx, name in enumerate(_count_names)}
 
 
@@ -195,7 +196,7 @@ class GraphData(Data):
     Mol features:
     - mol_name: str
     - mapped_smiles: str
-    - counts: IntTensor (COUNT_NAMES)  # [1, 9]
+    - counts: IntTensor (node, edge, fragment)
 
     Graph features:
     - node_features: IntTensor (atom_type, connectivity, formal_charge, ring_con, min_ring_size)  # [n_node, 5]
@@ -204,6 +205,12 @@ class GraphData(Data):
     - inc_node_edge: IntTensor  # [n_edge, 2]
     - inc_node_equiv: IntTensor  # [n_node, 1]
     - inc_edge_equiv: IntTensor  # [n_edge, 1]
+
+    Fragment view:
+    - inc_fragment_atom: IntTensor  # [n_node], atom -> fragment
+    - fragment_attachment: IntTensor  # [n_node, 1]
+    - inc_fragment_connection: IntTensor  # [n_connection_edge, 2]
+    - fragment_connection_features: IntTensor  # [n_connection_edge, 9]
     """
 
     def __init__(self,
@@ -265,6 +272,24 @@ class GraphData(Data):
             mol, self.inc_node_edge.tolist())
         self.inc_node_equiv = torch.tensor(atom_equi_index, dtype=int_dtype)
         self.inc_edge_equiv = torch.tensor(edge_equi_index, dtype=int_dtype)
+
+        # Fragment view. Atom indices are shared with the authoritative
+        # molecular graph, and every cross-fragment bond is retained.
+        fragment_graph = build_fragment_graph(mol.rkmol)
+        self.inc_fragment_atom = torch.tensor(fragment_graph.atom_to_fragment,
+                                              dtype=int_dtype)
+        self.fragment_attachment = torch.tensor(
+            fragment_graph.attachment_atoms, dtype=int_dtype).unsqueeze(-1)
+        self.inc_fragment_connection = torch.tensor(
+            fragment_graph.connection_index, dtype=int_dtype).reshape(-1, 2)
+        self.fragment_connection_features = torch.tensor(
+            fragment_graph.connection_features,
+            dtype=int_dtype).reshape(-1, 9)
+        self.fragment_schema_version = torch.tensor(
+            [fragment_graph.schema_version], dtype=int_dtype)
+        self.fragment_rule_version = torch.tensor(
+            [fragment_graph.rule_version], dtype=int_dtype)
+        self.set_count('fragment', fragment_graph.num_fragments)
 
 
 class MonoData(GraphData):

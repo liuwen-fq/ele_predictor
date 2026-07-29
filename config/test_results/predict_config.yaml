@@ -2,7 +2,7 @@
 
 ckpt_path: "<path to the checkpoint folder>" # Model checkpoint path
 save_dir: "<path to your data folder>" # Testing data path
-output_path: "<path to your output folder>"/output_test.json" # Output data path
+output_path: "<path to your output folder>/output_test.json" # Output data path
 data_cls: "FormulaData"
 key_map:
   concentration: "salt_molar_ratio"
@@ -25,6 +25,13 @@ model:
           heads: 4
           at_channels: 8
           ffn_dims: [32, 2]  # (hidden, layers)
+        fragment_block:
+          enabled: true
+          hidden_dim: 64
+          connection_feature_dim: 9
+          num_message_layers: 1
+          gate_init: -4.0
+          neutral_only: true
       readout_block:
         input_dim: 64
         hidden_dims: [256, 128, 16]

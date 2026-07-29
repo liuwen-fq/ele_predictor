@@ -1,0 +1,50 @@
+ckpt_path: "run/fragment_pipeline/ckpt_formula_ft"
+save_dir: "run/fragment_pipeline/data/ft_test"
+output_path: "run/fragment_pipeline/results/ft_test_predictions.json"
+data_cls: "FormulaData"
+key_map:
+  concentration: "salt_molar_ratio"
+  temperature: "temperature"
+
+model:
+  pretrain:
+    model_config:
+      graph_block:
+        feature_layer:
+          atom_embedding_dim: 16
+          node_mlp_dims: [32, 32, 2]
+          edge_mlp_dims: [32, 32, 2]
+          act: gelu
+        gnn_layer:
+          gnn_type: EGT
+          gnn_dims: [32, 32, 3]
+          jk: cat
+          act: gelu
+          heads: 4
+          at_channels: 8
+          ffn_dims: [32, 2]
+        fragment_block:
+          enabled: true
+          hidden_dim: 64
+          connection_feature_dim: 9
+          num_message_layers: 1
+          gate_init: -4.0
+          neutral_only: true
+      readout_block:
+        input_dim: 64
+        hidden_dims: [256, 128, 16]
+        output_dim: 1
+  model:
+    aggr_block:
+      node_emb_dim: 32
+      node_att_dim: 32
+      edge_emb_dim: 32
+      edge_att_dim: 32
+    readout_block:
+      input_dim: 384
+      hidden_dims: [512, 128, 16]
+      output_dim: 1
+    anion_block:
+      input_dim: 400
+      hidden_dims: [512, 128, 16]
+      output_dim: 1

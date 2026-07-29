@@ -1,0 +1,87 @@
+# Fragment-aware molecular pretraining.
+# Reprocess mono_data.json before training so fragment tensors are available.
+
+meta:
+  work_folder: "run/fragment_pipeline/ckpt_mono"
+  random_seed: 123
+  dataset_seed: 123
+  fp64: false
+  print_grad: false
+  save_debug_data: false
+
+dataset:
+  - config: "run/mono/fragment_preprocess/dataset_config.yaml"
+    batch_size: 512
+    shuffle: true
+    train_ratio: 0.7
+    loss_weight: 1.0
+    num_workers: 4
+    prefetch_factor: 4
+    loss:
+      - loss_type: Tm_MSE
+        weight: 1.0
+      - loss_type: bp_MSE
+        weight: 1.0
+      - loss_type: nD_MSE
+        weight: 1.0
+      - loss_type: nD_liquid_MSE
+        weight: 1.0
+      - loss_type: pka_a_MSE
+        weight: 1.0
+      - loss_type: pka_b_MSE
+        weight: 1.0
+      - loss_type: dc_MSE
+        weight: 1.0
+      - loss_type: ST_MSE
+        weight: 1.0
+      - loss_type: density_MSE
+        weight: 1.0
+      - loss_type: vis_MSE
+        weight: 1.0
+      - loss_type: vapP_MSE
+        weight: 1.0
+
+model:
+  graph_block:
+    feature_layer:
+      atom_embedding_dim: 16
+      node_mlp_dims: [32, 32, 2]
+      edge_mlp_dims: [32, 32, 2]
+      act: gelu
+    gnn_layer:
+      gnn_type: EGT
+      gnn_dims: [32, 32, 3]
+      jk: cat
+      act: gelu
+      heads: 4
+      at_channels: 8
+      ffn_dims: [32, 2]
+    fragment_block:
+      enabled: true
+      hidden_dim: 64
+      connection_feature_dim: 9
+      num_message_layers: 1
+      gate_init: -4.0
+      neutral_only: true
+  readout_block:
+    input_dim: 64
+    hidden_dims: [256, 128, 16]
+    output_dim: 1
+
+training:
+  valid_interval: 2
+  ckpt_interval: 100
+  max_epoch: 1999
+  amp: false
+  optimizer:
+    type: RAdam
+    lr: 1.0e-3
+  scheduler:
+    type: ReduceLROnPlateau
+    factor: 0.9
+    patience: 3
+    threshold_mode: abs
+    threshold: 1.0e-6
+    min_lr: 1.0e-7
+  early_stop_patience: 20
+  ignore_tolerance: 1.0e-6

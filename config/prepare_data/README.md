@@ -22,10 +22,16 @@ This document explains the three YAML configuration files for dataset processing
 
 ### 1. mono_config.yaml
 For single-molecule data
+
+`task` is required for molecular preprocessing: use `inference` for records
+with one measurement temperature, and `pretrain` for multi-property molecular
+pretraining records.
+
 ```yaml
 # Example configuration
 json_path: "<path to your data folder>/data.json" # path to your data folder
 save_dir: "<path to your data folder>" # the processed data will be generally stored in the same folder
+task: inference # use `pretrain` for multi-property molecular pretraining data
 
 data_cls: MonoData
 # input feature

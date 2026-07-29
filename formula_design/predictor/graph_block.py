@@ -21,6 +21,7 @@ from torch_geometric.nn import MLP, Linear
 from torch_geometric.utils import scatter
 
 from formula_design.data import Data
+from formula_design.predictor.fragment_block import FragmentBlock
 from formula_design.predictor.gnn import EGT, GAT, GINE, BasicGNN
 from formula_design.utils.definitions import (MAX_CONNECTIVITY,
                                               MAX_FORMAL_CHARGE, MAX_RING_SIZE,
@@ -236,7 +237,8 @@ class Graph2DBlock(Module):
 
     def __init__(self,
                  feature_layer: dict = None,
-                 gnn_layer: dict = None) -> None:
+                 gnn_layer: dict = None,
+                 fragment_block: dict = None) -> None:
         super().__init__()
         feature_layer = {} if feature_layer is None else feature_layer
         gnn_layer = {} if gnn_layer is None else gnn_layer
@@ -248,11 +250,27 @@ class Graph2DBlock(Module):
         self.node_out_dim = self.gnn_layer.node_out_dim
         self.edge_out_dim = self.gnn_layer.edge_out_dim
 
+        fragment_block = {} if fragment_block is None else fragment_block.copy(
+        )
+        self.fragment_enabled = fragment_block.pop("enabled", False)
+        if self.fragment_enabled:
+            self.fragment_block = FragmentBlock(
+                node_dim=self.node_out_dim,
+                edge_dim=self.edge_out_dim,
+                **fragment_block,
+            )
+        else:
+            self.fragment_block = None
+
     def reset_parameters(self):
         self.feature_layer.reset_parameters()
         self.gnn_layer.reset_parameters()
+        if self.fragment_block is not None:
+            self.fragment_block.reset_parameters()
 
     def forward(self, graph: Data):
         x_h, e_h = self.feature_layer(graph)
         x_h, e_h = self.gnn_layer(graph, x_h, e_h)
+        if self.fragment_block is not None:
+            x_h, e_h = self.fragment_block(graph, x_h, e_h)
         return x_h, e_h

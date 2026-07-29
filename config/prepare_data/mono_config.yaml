@@ -1,9 +1,9 @@
-json_path: "<path to your data folder>/data.json"
-save_dir: "<path to your data folder>"
+json_path: "run/mono_inference.json"
+save_dir: "run/mono/inference_preprocess"
+task: inference
 
 data_cls: MonoData
 # input feature
 key_map:  
   temperature: temperature # temperature of the molecular property
-
 

@@ -1,0 +1,9 @@
+json_path: "run/fragment_pipeline/raw/md_train.json"
+save_dir: "run/fragment_pipeline/data/md_train"
+data_cls: FormulaData
+key_map:
+  concentration: salt_molar_ratio
+  temperature: temperature
+  conductivity_NE: conductivity_ne
+  conductivity_mistry: conductivity_mistry
+  anion_ratio: anion_ratio

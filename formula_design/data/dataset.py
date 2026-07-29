@@ -42,6 +42,7 @@ class DatasetConfig:
         self._config = {
             'json_path': '',
             'save_dir': '',  # path to json and h5 file
+            'task': None,  # optional preprocessing role: pretrain or inference
             'data_cls': 'Data',
             'key_map': {
                 'temperature': 'temperature',
@@ -157,6 +158,7 @@ class MonoDataset(Dataset[T]):
             molecules = json.load(file)
 
         data_list = []
+        fragment_counts = []
         mol_idx = 0
         for mol in molecules:
             if "." not in mol["smiles"]:
@@ -181,10 +183,24 @@ class MonoDataset(Dataset[T]):
                     continue
 
                 data_list.append(data)
+                fragment_counts.append(int(data.get_count('fragment')))
         os.makedirs(os.path.dirname(ds.processed_names[0]), exist_ok=True)
         torch.save([dict(d) for d in data_list], ds.processed_names[0])
         ds.config.to_yaml()
 
+        if fragment_counts:
+            counts = torch.tensor(fragment_counts, dtype=torch.float32)
+            quantiles = torch.quantile(counts, torch.tensor([0.5, 0.9, 0.99]))
+            logger.info(
+                "fragment statistics: min=%d, max=%d, mean=%.2f, "
+                "p50=%.0f, p90=%.0f, p99=%.0f",
+                int(counts.min().item()),
+                int(counts.max().item()),
+                counts.mean().item(),
+                quantiles[0].item(),
+                quantiles[1].item(),
+                quantiles[2].item(),
+            )
         logger.info(f'finished data processing')
 
 

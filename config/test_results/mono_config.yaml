@@ -21,6 +21,13 @@ model:
       heads: 4
       at_channels: 8
       ffn_dims: [32, 2]  # (hidden, layers)
+    fragment_block:
+      enabled: true
+      hidden_dim: 64
+      connection_feature_dim: 9
+      num_message_layers: 1
+      gate_init: -4.0
+      neutral_only: true
   readout_block:
     input_dim: 64
     hidden_dims: [256, 128, 16]

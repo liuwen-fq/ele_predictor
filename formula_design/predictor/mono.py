@@ -132,7 +132,21 @@ class Mono(torch.nn.Module):
             return self.graph_embed_block.parameters()
 
     def load_ckpt(self, ckpt_path):
-        self.load_state_dict(torch.load(ckpt_path)['model_state_dict'])
+        state_dict = torch.load(ckpt_path)['model_state_dict']
+        strict = not self.graph_embed_block.fragment_enabled
+        incompatible = self.load_state_dict(state_dict, strict=strict)
+        if not strict:
+            allowed_prefix = "graph_embed_block.fragment_block."
+            invalid_missing = [
+                key for key in incompatible.missing_keys
+                if not key.startswith(allowed_prefix)
+            ]
+            if invalid_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "checkpoint is incompatible beyond the new fragment "
+                    f"branch; missing={invalid_missing}, "
+                    f"unexpected={incompatible.unexpected_keys}")
+        return incompatible
 
     def _compute_embedding(self, data: Data):
         """

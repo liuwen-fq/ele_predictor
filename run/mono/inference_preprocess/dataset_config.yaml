@@ -1,0 +1,7 @@
+data_cls: MonoData
+json_path: run/mono_inference.json
+key_map:
+  temperature: temperature
+kwargs: {}
+save_dir: run/mono/inference_preprocess
+timestamp: '26_07_14_15_31_59'

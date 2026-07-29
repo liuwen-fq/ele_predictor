@@ -1,0 +1,86 @@
+meta:
+  work_folder: "run/fragment_pipeline/ckpt_formula_md"
+  random_seed: 123
+  dataset_seed: 123
+  fp64: false
+  print_grad: false
+  save_debug_data: false
+
+dataset:
+  - config: "run/fragment_pipeline/data/md_train/dataset_config.yaml"
+    valid_config: "run/fragment_pipeline/data/md_valid/dataset_config.yaml"
+    valid_root: true
+    batch_size: 512
+    shuffle: true
+    loss_weight: 1.0
+    num_workers: 4
+    prefetch_factor: 4
+    loss:
+      - loss_type: conductivity_NE_MAE
+        weight: 1.0
+      - loss_type: conductivity_mistry_MAE
+        weight: 1.0
+      - loss_type: anion_ratio_MAE
+        weight: 1.0
+
+model:
+  pretrain:
+    ckpt_path: "run/fragment_pipeline/ckpt_mono/optimal.pt"
+    model_config:
+      graph_block:
+        feature_layer:
+          atom_embedding_dim: 16
+          node_mlp_dims: [32, 32, 2]
+          edge_mlp_dims: [32, 32, 2]
+          act: gelu
+        gnn_layer:
+          gnn_type: EGT
+          gnn_dims: [32, 32, 3]
+          jk: cat
+          act: gelu
+          heads: 4
+          at_channels: 8
+          ffn_dims: [32, 2]
+        fragment_block:
+          enabled: true
+          hidden_dim: 64
+          connection_feature_dim: 9
+          num_message_layers: 1
+          gate_init: -4.0
+          neutral_only: true
+      readout_block:
+        input_dim: 64
+        hidden_dims: [256, 128, 16]
+        output_dim: 1
+  model:
+    aggr_block:
+      node_emb_dim: 32
+      node_att_dim: 32
+      edge_emb_dim: 32
+      edge_att_dim: 32
+    readout_block:
+      input_dim: 384
+      hidden_dims: [512, 128, 16]
+      output_dim: 1
+    anion_block:
+      input_dim: 400
+      hidden_dims: [512, 128, 16]
+      output_dim: 1
+
+training:
+  valid_interval: 2
+  ckpt_interval: 100
+  max_epoch: 1999
+  amp: false
+  optimizer:
+    type: RAdam
+    lr: 1.0e-3
+  scheduler:
+    type: ReduceLROnPlateau
+    factor: 0.9
+    patience: 3
+    threshold_mode: abs
+    threshold: 1.0e-6
+    min_lr: 1.0e-7
+  early_stop_patience: 20
+  ignore_tolerance: 1.0e-6

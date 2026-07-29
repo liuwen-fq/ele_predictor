@@ -1,0 +1,10 @@
+json_path: "run/fragment_pipeline/raw/ft_test.json"
+save_dir: "run/fragment_pipeline/data/ft_test"
+data_cls: FormulaData
+key_map:
+  concentration: salt_molar_ratio
+  temperature: temperature
+  conductivity: conductivity
+  conductivity_mask: conductivity_mask
+  anion_ratio: anion_ratio
+  anion_ratio_mask: anion_ratio_mask
