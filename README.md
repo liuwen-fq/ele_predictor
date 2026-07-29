@@ -1,115 +1,108 @@
-<div align="center">
- 👋 Hi, everyone! 
-    <br>
-    We are <b>ByteDance Seed team.</b>
-</div>
+# Interpretable Electrolyte Property Prediction
 
-<p align="center">
-  You can get to know us better through the following channels👇
-  <br>
-  <a href="https://seed.bytedance.com/">
-    <img src="https://img.shields.io/badge/Website-%231e37ff?style=for-the-badge&logo=bytedance&logoColor=white"></a>
-  <a href="https://github.com/user-attachments/assets/5793e67c-79bb-4a59-811a-fcc7ed510bd4">
-    <img src="https://img.shields.io/badge/WeChat-07C160?style=for-the-badge&logo=wechat&logoColor=white"></a>
- <a href="https://www.xiaohongshu.com/user/profile/668e7e15000000000303157d?xsec_token=ABl2-aqekpytY6A8TuxjrwnZskU-6BsMRE_ufQQaSAvjc%3D&xsec_source=pc_search">
-    <img src="https://img.shields.io/badge/Xiaohongshu-%23FF2442?style=for-the-badge&logo=xiaohongshu&logoColor=white"></a>
-  <a href="https://www.zhihu.com/org/dou-bao-da-mo-xing-tuan-dui/">
-    <img src="https://img.shields.io/badge/zhihu-%230084FF?style=for-the-badge&logo=zhihu&logoColor=white"></a>
-</p>
+This repository is an independent research extension of **Bamboo-Mixer** for
+electrolyte formulation and conductivity prediction. It is developed on top
+of the open-source work published by the ByteDance Seed team, while focusing
+on extending the molecular representation and interpretability of the
+predictive model.
 
-<div align="center">
-  <img src="./overview.png" alt="plot" height="400">
-</div>
+## Acknowledgement
 
-<!-- 注释：以上为Seed官方信息，可直接复制使用，请注意导入“Seed WeChat”（第12行）、“Seed logo”(第20行)图片替换 -->
+We sincerely thank the ByteDance Seed team for publishing **Bamboo-Mixer** and
+for providing the original implementation and accompanying resources. Their
+work established the three-stage predictive framework used as the foundation
+of this repository:
 
+1. Molecular-level pretraining with molecular property labels.
+2. Formulation-level pretraining with molecular dynamics data.
+3. Experimental fine-tuning with measured conductivity data.
 
-# A Predictive and Generative Solution for Liquid Electrolyte Formulation
-<p align="center">
-  <a href="https://huggingface.co/ByteDance-Seed/bamboo_mixer">
-    <img src="https://img.shields.io/badge/Bamboo_mixer-Hugging Face-orange"></a>
-  <a href="https://www.apache.org/licenses/LICENSE-2.0">
-    <img src="https://img.shields.io/badge/Apache License, Version 2.0-blue"></a>
-</p>
+The original paper and implementation are available at:
 
-We are extremely delighted to release **Bamboo-Mixer**. **Bamboo-Mixer** introduces a unified method to not only **predict electrolyte properties** accurately such as conductivity and anion ratio, but also allows **conditional generation** of electrolyte formulation based on target properties. 
+- Paper: [A Unified Predictive and Generative Solution for Liquid Electrolyte Formulation](https://arxiv.org/abs/2504.18728)
+- Original repository: [ByteDance-Seed/bamboo_mixer](https://github.com/ByteDance-Seed/bamboo_mixer)
+- Original data and checkpoints: [ByteDance-Seed/bamboo_mixer](https://huggingface.co/ByteDance-Seed/bamboo_mixer)
 
-This innovation provides a generative workflow to **design molecular mixture** beyond electrolyte. The generated samples from the workflow are tested and proved further with experimental validation..
+## Current Research Direction
 
-## Data preparation
-There are two different types of data: [`MonoData`](./formula_design/data/data.py#L272) and [`FormulaData`](./formula_design/data/data.py#L362)
-- [`MonoData`](./formula_design/data/data.py#L272): single molecule data with molecular property labels.
-- [`FormulaData`](./formula_design/data/data.py#L362): Molecular mixture data for liquid electrolytes with conductivity and anion ratio information. 
+The main extension in this repository is a chemistry-constrained **fragment
+encoder** at the molecular level. Molecules are decomposed into chemically
+meaningful fragments while preserving rings, functional groups, and the
+connections between fragments. Fragment representations are then aggregated
+inside each molecule and integrated with the original molecular graph
+representation.
 
-More details about how to prepare data for different stages of training and inference can be found in [Data Preparation Instructions](./scripts/prepare_data/README.md).
+This design is intended to make electrolyte conductivity prediction more
+interpretable, especially for understanding how solvent fragments and their
+functional roles contribute to the final molecular and formulation-level
+representation. The original Bamboo-Mixer prediction pipeline is retained as
+the baseline so that the effect of fragment encoding can be evaluated under
+the same data and training protocol.
 
-## Training
-**Predictive model (Three-stage training):**
-1. Molecular pretraining: Multi-task learning of molecular property predictions.
-2. Computational pretraining: Prediction of formulation property from MD simulation.
-3. Experimental fine-tuning: Fine-tuning with experimental conductivity data. 
+## Training Framework
 
-**Generative model (Dual-stage training):**
-1. Conditional diffusion: conditional DDPM to generate electrolyte embedding.
-2. Decoder and distance matching: decode electrolyte embedding and obtain formulation.
+The predictive model follows the original three-stage organization:
 
-See [Training Instructions](./scripts/train/README.md) for more details.
+1. **Molecular pretraining:** multi-task prediction of molecular properties
+   with fragment-aware molecular encoding.
+2. **MD formulation pretraining:** prediction of formulation properties from
+   molecular dynamics data.
+3. **Experimental fine-tuning:** fine-tuning on measured conductivity data and
+   evaluating on an independent experimental test set.
 
-## Inference and Generation
-**Molecular property prediction (11 molecular properties):**
-- Tₘ: melting point (K)
-- bp: boiling point (K)
-- nD: refractive index (unitless)
-- nD_liquid: refractive index (liquid, unitless)
-- pka_a: pKa (unitless)
-- pka_b: pKb (unitless)
-- dc: dielectric constant (unitless)
-- ST: surface tension (mN/m)
-- density: mass density (g/cm^3)
-- vis: viscosity (cP)
-- vapP: vapor pressure (Pa)
+The current implementation concentrates on molecular-level encoding. Parameter-
+level attribution and intervention methods are intentionally reserved for a
+later stage, after the fragment-aware model has been shown to preserve the
+conductivity prediction accuracy of the original baseline.
 
-**Predictive model (2 electrolyte properties):**
-- Conductivity (mS/cm).
-- Anion ratio (unitless, between 0 and 1).
+Detailed instructions for preprocessing, training, and conductivity
+evaluation are available in:
 
-**Generative model (3 generated files):**
-- Electrolyte embedding.
-- BoM vector of formulation.
-- Corresponding conductivity and anion ratio.
+- [Data preparation instructions](./scripts/prepare_data/README.md)
+- [Training instructions](./scripts/train/README.md)
+- [Fragment model training and conductivity evaluation](./执行片段模型训练与电导率评估.md)
+- [Inference instructions](./scripts/test_results/README.md)
 
-See [Inference Instructions](./scripts/test_results/README.md) for more details.
+## Molecular and Formulation Data
 
-## Data availability
-The datasets and checkpoints can be found on HuggingFace: [huggingface/bamboo_mixer](https://huggingface.co/ByteDance-Seed/bamboo_mixer)
+The repository uses two main data structures inherited from Bamboo-Mixer:
 
+- `MonoData`: single-molecule structures and molecular property labels.
+- `FormulaData`: solvent-salt formulations with concentration, temperature,
+  conductivity, and anion-ratio information.
 
-## Contributing
-We welcome contributions to BAMBOO-Mixer! If you have suggestions or improvements, please refers to `CONTRIBUTING.md`
+The original datasets and checkpoints can be obtained from the Bamboo-Mixer
+resources linked above. New preprocessing outputs, fragment graphs, model
+checkpoints, and evaluation results should be kept in local working directories
+and should not be confused with the original published artifacts.
 
+## Future Work
 
+The next stage will extend the model toward **multi-task downstream transfer**.
+Potential downstream tasks include conductivity, viscosity, density, ion
+transport-related properties, and other experimentally measured electrolyte
+properties. The goal is to reuse the fragment-aware molecular representation
+across related tasks while retaining chemically meaningful fragment-level
+interpretations.
 
 ## License
-This project is licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
+This project follows the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+of the original Bamboo-Mixer codebase. Please retain the original attribution
+and citation when using or redistributing derivative work.
 
 ## Citation
-If you find BAMBOO-Mixer useful for your research and applications, feel free to give us a star ⭐ or cite us using:
+
+If you use the original Bamboo-Mixer framework, please cite:
 
 ```bibtex
 @misc{yang2025unifiedpredictivegenerativesolution,
-      title={A Unified Predictive and Generative Solution for Liquid Electrolyte Formulation}, 
+      title={A Unified Predictive and Generative Solution for Liquid Electrolyte Formulation},
       author={Zhenze Yang and Yifan Wu and Xu Han and Ziqing Zhang and Haoen Lai and Zhenliang Mu and Tianze Zheng and Siyuan Liu and Zhichen Pu and Zhi Wang and Zhiao Yu and Sheng Gong and Wen Yan},
       year={2025},
       eprint={2504.18728},
       archivePrefix={arXiv},
       primaryClass={cond-mat.mtrl-sci},
-      url={https://arxiv.org/abs/2504.18728}, 
+      url={https://arxiv.org/abs/2504.18728}
 }
 ```
-
-## About [ByteDance Seed Team](https://seed.bytedance.com/)
-
-Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's most advanced AI foundation models. The team aspires to become a world-class research team and make significant contributions to the advancement of science and society.
-
-<!-- 注释：About ByteDance Seed Team可直接复制使用 -->
-
