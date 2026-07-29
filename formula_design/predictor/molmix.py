@@ -124,11 +124,15 @@ class MolMix(torch.nn.Module):
         with torch.no_grad():
             solv_node_h, solv_edge_h = self.graph_embed_block._compute_embedding(
                 data.solv_graphs)
+            solv_fragment_diagnostics = (
+                self.graph_embed_block.get_fragment_diagnostics())
             solv_vis = self.graph_embed_block.predict(data.solv_graphs,
                                                       data.temperature,
                                                       formula_vis=True)["vis"]
             salt_node_h, salt_edge_h = self.graph_embed_block._compute_embedding(
                 data.salt_graphs)
+            salt_fragment_diagnostics = (
+                self.graph_embed_block.get_fragment_diagnostics())
 
         solv_node_h_inv, solv_edge_h_inv = self.aggr_block_solv(
             data.solv_graphs, solv_node_h, solv_edge_h)
@@ -168,5 +172,9 @@ class MolMix(torch.nn.Module):
         return {
             "h_inv": h_inv,
             "conductivity": sigma_T,
-            "anion_ratio": anion_ratio
+            "anion_ratio": anion_ratio,
+            "fragment_diagnostics": {
+                "solvents": solv_fragment_diagnostics,
+                "salts": salt_fragment_diagnostics,
+            },
         }

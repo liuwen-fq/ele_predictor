@@ -23,6 +23,7 @@ import yaml
 from torch.utils.data import DataLoader
 
 from formula_design.data import FormulaData, GraphData, MXDataset, collate_data
+from formula_design.fragment import attach_fragment_attention
 from formula_design.predictor import MolMix, Mono
 from formula_design.train import FormulaTrainer, TrainConfig
 from formula_design.utils import setup_default_logging, to_dense_batch
@@ -44,6 +45,21 @@ def make_hook(output_store, layer_name):
         ).tolist()
 
     return hook_fn
+
+
+def collect_fragment_attention(component_graph, diagnostics):
+    """Match last-forward fragment attention with serialized molecule metadata."""
+
+    if diagnostics is None:
+        return None
+    if "fragment_metadata" not in component_graph:
+        raise ValueError(
+            "fragment metadata is missing; reprocess the prediction dataset")
+    return attach_fragment_attention(
+        component_graph.fragment_metadata,
+        diagnostics["attention"].detach().cpu().tolist(),
+        diagnostics["neutral_only"],
+    )
 
 
 def main():
@@ -80,6 +96,7 @@ def main():
     Bs = []
     sigma0s = []
     viss = []
+    fragment_attention = []
 
     for batch_idx, graph in enumerate(valid_dl):
 
@@ -114,6 +131,19 @@ def main():
         pred_conductivities = torch.exp(pred["conductivity"].squeeze(-1) *
                                         8.3344 - 4.6002)
         pred_anion_ratios = pred["anion_ratio"].squeeze(-1)
+
+        fragment_diagnostics = pred["fragment_diagnostics"]
+        solvents_attention = collect_fragment_attention(
+            graph.solv_graphs, fragment_diagnostics["solvents"])
+        salts_attention = collect_fragment_attention(
+            graph.salt_graphs, fragment_diagnostics["salts"])
+        if solvents_attention is None or salts_attention is None:
+            fragment_attention.extend([None] * pred_conductivities.shape[0])
+        else:
+            fragment_attention.extend({
+                "solvents": solvents,
+                "salts": salts,
+            } for solvents, salts in zip(solvents_attention, salts_attention))
 
         for c in pred_conductivities:
             conductivities_pred.append(c.item())
@@ -177,6 +207,8 @@ def main():
         entry["B"] = Bs[i]
         entry["T0"] = T0s[i]
         entry["vis"] = viss[i]
+        if fragment_attention[i] is not None:
+            entry["fragment_attention"] = fragment_attention[i]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 

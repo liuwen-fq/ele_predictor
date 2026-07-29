@@ -159,6 +159,20 @@ class Mono(torch.nn.Module):
 
         return node_h, edge_h
 
+    def get_fragment_diagnostics(self):
+        """Return detached fragment-pooling diagnostics from the last forward."""
+
+        fragment_block = self.graph_embed_block.fragment_block
+        if fragment_block is None:
+            return None
+        if fragment_block.last_fragment_attention is None:
+            raise RuntimeError(
+                "fragment diagnostics requested before encoding")
+        return {
+            "attention": fragment_block.last_fragment_attention,
+            "neutral_only": fragment_block.neutral_only,
+        }
+
     def forward(self, data: Data):
         """
         """

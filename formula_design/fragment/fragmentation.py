@@ -227,6 +227,120 @@ def build_fragment_graph(mol: Chem.Mol,
     return fragment_graph
 
 
+def build_fragment_metadata(mol: Chem.Mol,
+                            fragment_graph: FragmentGraph) -> dict:
+    """Return a JSON-serializable description of a fragment graph.
+
+    Atom indices are zero-based RDKit indices of ``mol``. Connections are
+    represented once per cut bond, unlike ``connection_index`` which stores
+    both directed message-passing edges.
+    """
+
+    components = [[] for _ in range(fragment_graph.num_fragments)]
+    for atom_idx, fragment_idx in enumerate(fragment_graph.atom_to_fragment):
+        components[fragment_idx].append(atom_idx)
+
+    fragments = []
+    for fragment_idx, atom_indices in enumerate(components):
+        fragments.append({
+            "fragment_id":
+            fragment_idx,
+            "smiles":
+            Chem.MolFragmentToSmiles(
+                mol,
+                atomsToUse=atom_indices,
+                canonical=True,
+                isomericSmiles=True,
+            ),
+            "atom_indices":
+            atom_indices,
+            "atom_map_numbers": [
+                mol.GetAtomWithIdx(atom_idx).GetAtomMapNum()
+                for atom_idx in atom_indices
+            ],
+            "attachment_atom_indices": [
+                atom_idx for atom_idx in atom_indices
+                if fragment_graph.attachment_atoms[atom_idx]
+            ],
+        })
+
+    connections = []
+    for bond_idx in fragment_graph.cut_bond_indices:
+        bond = mol.GetBondWithIdx(bond_idx)
+        begin_idx = bond.GetBeginAtomIdx()
+        end_idx = bond.GetEndAtomIdx()
+        connections.append({
+            "bond_index":
+            bond_idx,
+            "fragment_ids": [
+                fragment_graph.atom_to_fragment[begin_idx],
+                fragment_graph.atom_to_fragment[end_idx],
+            ],
+            "atom_indices": [begin_idx, end_idx],
+            "atom_map_numbers": [
+                mol.GetAtomWithIdx(begin_idx).GetAtomMapNum(),
+                mol.GetAtomWithIdx(end_idx).GetAtomMapNum(),
+            ],
+            "bond_type":
+            str(bond.GetBondType()),
+            "is_aromatic":
+            bool(bond.GetIsAromatic()),
+        })
+
+    return {
+        "fragment_schema_version": fragment_graph.schema_version,
+        "fragment_rule_version": fragment_graph.rule_version,
+        "formal_charge":
+        sum(atom.GetFormalCharge() for atom in mol.GetAtoms()),
+        "fragments": fragments,
+        "connections": connections,
+    }
+
+
+def attach_fragment_attention(metadata_by_formula: list[list[dict]],
+                              attention_values: list[float],
+                              neutral_only: bool) -> list[list[dict]]:
+    """Attach per-fragment pooling weights to serialized molecular metadata."""
+
+    offset = 0
+    output = []
+    for formula_metadata in metadata_by_formula:
+        formula_output = []
+        for molecule_metadata in formula_metadata:
+            fragments = molecule_metadata["fragments"]
+            next_offset = offset + len(fragments)
+            if next_offset > len(attention_values):
+                raise ValueError("fragment attention is shorter than metadata")
+
+            annotated_fragments = []
+            for fragment, attention in zip(
+                    fragments, attention_values[offset:next_offset]):
+                annotated_fragment = dict(fragment)
+                annotated_fragment["pooling_attention"] = float(attention)
+                annotated_fragments.append(annotated_fragment)
+
+            formula_output.append({
+                "molecule_name":
+                molecule_metadata["molecule_name"],
+                "mapped_smiles":
+                molecule_metadata["mapped_smiles"],
+                "formal_charge":
+                molecule_metadata["formal_charge"],
+                "fragment_encoder_applied":
+                (not neutral_only or molecule_metadata["formal_charge"] == 0),
+                "fragments":
+                annotated_fragments,
+                "connections":
+                molecule_metadata["connections"],
+            })
+            offset = next_offset
+        output.append(formula_output)
+
+    if offset != len(attention_values):
+        raise ValueError("fragment attention is longer than metadata")
+    return output
+
+
 def validate_fragment_graph(mol: Chem.Mol,
                             fragment_graph: FragmentGraph) -> None:
     """Validate that fragments and connection edges preserve molecular topology."""

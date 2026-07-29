@@ -22,7 +22,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from formula_design.fragment import build_fragment_graph
+from formula_design.fragment import (build_fragment_graph,
+                                     build_fragment_metadata)
 from formula_design.mol import Molecule, MoleculeGraph
 from formula_design.utils.definitions import (ELEMENT_MAP, MAX_RING_SIZE,
                                               BondOrder)
@@ -211,6 +212,7 @@ class GraphData(Data):
     - fragment_attachment: IntTensor  # [n_node, 1]
     - inc_fragment_connection: IntTensor  # [n_connection_edge, 2]
     - fragment_connection_features: IntTensor  # [n_connection_edge, 9]
+    - fragment_metadata: dict  # JSON-ready fragment structures and connections
     """
 
     def __init__(self,
@@ -276,6 +278,9 @@ class GraphData(Data):
         # Fragment view. Atom indices are shared with the authoritative
         # molecular graph, and every cross-fragment bond is retained.
         fragment_graph = build_fragment_graph(mol.rkmol)
+        fragment_metadata = build_fragment_metadata(mol.rkmol, fragment_graph)
+        fragment_metadata["molecule_name"] = mol.name
+        fragment_metadata["mapped_smiles"] = self.mapped_smiles
         self.inc_fragment_atom = torch.tensor(fragment_graph.atom_to_fragment,
                                               dtype=int_dtype)
         self.fragment_attachment = torch.tensor(
@@ -289,6 +294,7 @@ class GraphData(Data):
             [fragment_graph.schema_version], dtype=int_dtype)
         self.fragment_rule_version = torch.tensor(
             [fragment_graph.rule_version], dtype=int_dtype)
+        self.fragment_metadata = fragment_metadata
         self.set_count('fragment', fragment_graph.num_fragments)
 
 
