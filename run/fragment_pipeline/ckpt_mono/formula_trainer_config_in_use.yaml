@@ -1,0 +1,96 @@
+dataset:
+- batch_size: 512
+  config: run/mono/fragment_preprocess/dataset_config.yaml
+  loss:
+  - loss_type: Tm_MSE
+    weight: 1.0
+  - loss_type: bp_MSE
+    weight: 1.0
+  - loss_type: nD_MSE
+    weight: 1.0
+  - loss_type: nD_liquid_MSE
+    weight: 1.0
+  - loss_type: pka_a_MSE
+    weight: 1.0
+  - loss_type: pka_b_MSE
+    weight: 1.0
+  - loss_type: dc_MSE
+    weight: 1.0
+  - loss_type: ST_MSE
+    weight: 1.0
+  - loss_type: density_MSE
+    weight: 1.0
+  - loss_type: vis_MSE
+    weight: 1.0
+  - loss_type: vapP_MSE
+    weight: 1.0
+  loss_weight: 1.0
+  num_workers: 4
+  prefetch_factor: 4
+  shuffle: true
+  train_ratio: 0.7
+meta:
+  dataset_seed: 123
+  fp64: false
+  print_grad: false
+  random_seed: 123
+  save_debug_data: false
+  work_folder: run/fragment_pipeline/ckpt_mono
+model:
+  graph_block:
+    feature_layer:
+      act: gelu
+      atom_embedding_dim: 16
+      edge_mlp_dims:
+      - 32
+      - 32
+      - 2
+      node_mlp_dims:
+      - 32
+      - 32
+      - 2
+    fragment_block:
+      connection_feature_dim: 9
+      enabled: true
+      gate_init: -4.0
+      hidden_dim: 64
+      neutral_only: true
+      num_message_layers: 1
+    gnn_layer:
+      act: gelu
+      at_channels: 8
+      ffn_dims:
+      - 32
+      - 2
+      gnn_dims:
+      - 32
+      - 32
+      - 3
+      gnn_type: EGT
+      heads: 4
+      jk: cat
+  readout_block:
+    hidden_dims:
+    - 256
+    - 128
+    - 16
+    input_dim: 64
+    output_dim: 1
+training:
+  amp: false
+  ckpt_interval: 100
+  early_stop_patience: 20
+  ignore_tolerance: 1.0e-06
+  max_epoch: 1999
+  optimizer:
+    lr: 0.001
+    type: RAdam
+  optimizer_params: {}
+  scheduler:
+    factor: 0.9
+    min_lr: 1.0e-07
+    patience: 3
+    threshold: 1.0e-06
+    threshold_mode: abs
+    type: ReduceLROnPlateau
+  valid_interval: 2
