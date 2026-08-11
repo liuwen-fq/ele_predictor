@@ -58,6 +58,7 @@ class LossType(Enum):
     fragment_residual_L2 = 29
     conductivity_explain_MAE = 30
     conductivity_explain_fidelity_MAE = 31
+    property_effect_L1 = 32
 
 
 def loss_func(preds: dict, data: MixData, loss_type: LossType, **kwargs):
@@ -357,9 +358,11 @@ def loss_func(preds: dict, data: MixData, loss_type: LossType, **kwargs):
             LossType.fragment_main_L1,
             LossType.fragment_interaction_L1,
             LossType.fragment_residual_L2,
+            LossType.property_effect_L1,
     }:
         task = kwargs.get("task", "conductivity_mistry")
         contributions = (preds.get("fragment_contributions")
+                         or preds.get("property_fragment_explanations")
                          or preds.get("fragment_explanations"))
         if contributions is None:
             raise ValueError(
@@ -378,9 +381,15 @@ def loss_func(preds: dict, data: MixData, loss_type: LossType, **kwargs):
             values = task_values.get("raw_interaction_sum",
                                      task_values["interaction_sum"])
             loss = values.abs().mean() if values.numel() else values.sum()
-        else:
+        elif loss_type is LossType.fragment_residual_L2:
             values = task_values.get("raw_residual", task_values["residual"])
             loss = values.square().mean() if values.numel() else values.sum()
+        else:
+            values = task_values.get("raw_property_molecule_effect")
+            if values is None:
+                raise ValueError(
+                    "property_effect_L1 requires a property-fragment explanation head")
+            loss = values.abs().mean() if values.numel() else values.sum()
 
     else:
         raise NotImplementedError(loss_type)

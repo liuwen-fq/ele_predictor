@@ -638,3 +638,155 @@ class ConditionAwareFragmentExplainer(ConditionAwareFragmentContribution):
             task_output["explanation_prediction"] = (
                 reference + task_output["residual"])
         return output
+
+
+class ConditionAwarePropertyFragmentExplainer(
+        ConditionAwareFragmentExplainer):
+    """Add explicit solvent-property terms to the additive fragment explainer.
+
+    The deployed Bamboo prediction is not changed.  This head models the
+    experimental conductivity decomposition as a condition reference, a
+    molar-ratio-weighted solvent-property term, and the existing bounded
+    fragment main/pair residual.  Property values come from the frozen
+    molecular multitask model, so this is an interpretable *model
+    decomposition*, not a claim that the listed properties are independent
+    causal mediators.
+    """
+
+    def __init__(self,
+                 *args,
+                 property_names=("dc", "vis", "Tm"),
+                 property_centers=None,
+                 property_scales=None,
+                 property_effect_scale: float = 0.10,
+                 property_bound: float = 0.25,
+                 **kwargs):
+        self.property_names = tuple(property_names)
+        if not self.property_names:
+            raise ValueError("at least one solvent property is required")
+        if len(set(self.property_names)) != len(self.property_names):
+            raise ValueError("property_names must be unique")
+        if property_effect_scale <= 0 or property_bound <= 0:
+            raise ValueError("property contribution scales must be positive")
+        property_count = len(self.property_names)
+        centers = ([0.5] * property_count if property_centers is None else
+                   list(property_centers))
+        scales = ([0.25] * property_count if property_scales is None else
+                  list(property_scales))
+        if len(centers) != property_count or len(scales) != property_count:
+            raise ValueError(
+                "property_centers and property_scales must match property_names")
+        if any(float(scale) <= 0 for scale in scales):
+            raise ValueError("property_scales must be positive")
+        self.property_effect_scale = float(property_effect_scale)
+        self.property_bound = float(property_bound)
+        super().__init__(*args, **kwargs)
+        self.register_buffer("property_centers",
+                             torch.tensor(centers, dtype=torch.float32))
+        self.register_buffer("property_scales",
+                             torch.tensor(scales, dtype=torch.float32))
+        self.property_condition = torch.nn.ModuleDict({
+            task: torch.nn.Linear(self.condition_input_dim, property_count)
+            for task in self.task_names
+        })
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        if hasattr(self, "property_condition"):
+            # Start from the previous condition + fragment explanation.  The
+            # property term then grows only when it improves experimental fit.
+            for projection in self.property_condition.values():
+                torch.nn.init.zeros_(projection.weight)
+                torch.nn.init.zeros_(projection.bias)
+
+    @staticmethod
+    def _molecule_formula_index(data, device):
+        molecule_counts = data.counts_mol[:, 0]
+        return torch.arange(molecule_counts.shape[0], dtype=torch.long,
+                            device=device).repeat_interleave(
+                                molecule_counts.long())
+
+    def _property_effects(self, data, solvent_properties, condition_h):
+        if solvent_properties.ndim != 2:
+            raise ValueError("solvent_properties must have shape [molecule, property]")
+        property_count = len(self.property_names)
+        if solvent_properties.shape[-1] != property_count:
+            raise ValueError(
+                f"expected {property_count} solvent properties, got "
+                f"{solvent_properties.shape[-1]}")
+        molecule_formula = self._molecule_formula_index(
+            data, solvent_properties.device)
+        if solvent_properties.shape[0] != molecule_formula.shape[0]:
+            raise ValueError(
+                "solvent property count does not match solvent molecule count")
+        formula_count = condition_h.shape[0]
+        molecule_ratio = data.molar_ratios.to(
+            device=solvent_properties.device,
+            dtype=solvent_properties.dtype).reshape(-1)
+        if molecule_ratio.shape[0] != molecule_formula.shape[0]:
+            raise ValueError("solvent molar-ratio count does not match molecules")
+        normalized = ((solvent_properties - self.property_centers.to(
+            solvent_properties)) / self.property_scales.to(solvent_properties))
+        outputs = {}
+        for task in self.task_names:
+            coefficients = self.property_condition[task](condition_h)
+            raw_molecule_effect = (
+                normalized * coefficients[molecule_formula]
+                * molecule_ratio.unsqueeze(-1) * self.property_effect_scale)
+            raw_by_property = scatter(
+                raw_molecule_effect,
+                molecule_formula,
+                dim=0,
+                dim_size=formula_count,
+                reduce="sum",
+            )
+            raw_sum = raw_by_property.sum(dim=-1)
+            bounded_sum, scale = self._bound_property_sum(raw_sum)
+            molecule_effect = raw_molecule_effect * scale[molecule_formula].unsqueeze(-1)
+            by_property = raw_by_property * scale.unsqueeze(-1)
+            outputs[task] = {
+                "property_names": self.property_names,
+                "property_values": solvent_properties,
+                "property_normalized": normalized,
+                "property_coefficients": coefficients,
+                "raw_property_molecule_effect": raw_molecule_effect,
+                "raw_property_by_name": raw_by_property,
+                "raw_property_sum": raw_sum,
+                "property_molecule_effect": molecule_effect,
+                "property_by_name": by_property,
+                "property_sum": bounded_sum,
+                "property_attribution_scale": scale,
+                "property_bound": bounded_sum.new_full(
+                    bounded_sum.shape, self.property_bound),
+            }
+        return molecule_formula, outputs
+
+    def _bound_property_sum(self, raw_sum):
+        scaled = raw_sum / self.property_bound
+        safe_scaled = torch.where(
+            scaled.abs() > 1.0e-6, scaled, torch.ones_like(scaled))
+        ratio = torch.tanh(safe_scaled) / safe_scaled
+        ratio = torch.where(
+            scaled.abs() > 1.0e-6,
+            ratio,
+            1.0 - scaled.square() / 3.0,
+        )
+        return self.property_bound * torch.tanh(scaled), ratio
+
+    def forward(self, data, fragment_h, fragment_batch, condition_h,
+                solvent_properties, fragment_active=None):
+        output = super().forward(data, fragment_h, fragment_batch,
+                                 condition_h, fragment_active)
+        molecule_formula, property_outputs = self._property_effects(
+            data, solvent_properties, condition_h)
+        for task in self.task_names:
+            task_output = output["tasks"][task]
+            property_output = property_outputs[task]
+            task_output.update(property_output)
+            task_output["explanation_prediction"] = (
+                task_output["condition_reference"]
+                + property_output["property_sum"]
+                + task_output["residual"])
+        output["property_molecule_formula_index"] = molecule_formula
+        return output

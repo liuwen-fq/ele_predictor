@@ -1,7 +1,5 @@
 meta:
-  # A separate work folder prevents accidental restart from the old run whose
-  # objective included fidelity to Bamboo predictions.
-  work_folder: "run/fragment_explanation_no_fidelity/ckpt_formula_ft"
+  work_folder: "run/property_fragment_explanation/ckpt_formula_ft"
   random_seed: 123
   dataset_seed: 123
   fp64: false
@@ -18,11 +16,14 @@ dataset:
     num_workers: 4
     prefetch_factor: 4
     loss:
-      # Supervise the condition reference + fragment decomposition directly
-      # with experimental conductivity.  There is deliberately no
-      # conductivity_explain_fidelity_MAE term in this experiment.
+      # The frozen Bamboo prediction is not part of this objective.  The
+      # independent explanation head is fitted directly to experiment.
       - loss_type: conductivity_explain_MAE
         weight: 1.0
+      - loss_type: property_effect_L1
+        weight: 0.0005
+        valid_weight: 0.0
+        kwargs: {task: conductivity_explain}
       - loss_type: fragment_main_L1
         weight: 0.001
         valid_weight: 0.0
@@ -84,7 +85,7 @@ model:
       input_dim: 400
       hidden_dims: [512, 128, 16]
       output_dim: 1
-    fragment_explanation_block:
+    property_fragment_explanation_block:
       enabled: true
       input_dim: 64
       condition_input_dim: 130
@@ -94,6 +95,13 @@ model:
       main_scale: 0.1
       interaction_scale: 0.05
       residual_bound: 0.2
+      # Molecular multitask outputs are normalized.  Centering makes the
+      # condition reference interpretable as an average-property baseline.
+      property_names: [dc, vis, Tm]
+      property_centers: [0.5, 0.5, 0.5]
+      property_scales: [0.25, 0.25, 0.25]
+      property_effect_scale: 0.1
+      property_bound: 0.25
       cross_molecule_only: true
       diagnostic_top_k_pairs: -1
       freeze_base_formula: true

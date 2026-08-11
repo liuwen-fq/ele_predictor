@@ -21,6 +21,7 @@ from formula_design.predictor.aggr import (
     AttentionAggr,
     ConditionAwareFragmentContribution,
     ConditionAwareFragmentExplainer,
+    ConditionAwarePropertyFragmentExplainer,
     FragmentFormulaAggr,
     VisAggr,
 )
@@ -83,7 +84,8 @@ class MolMix(torch.nn.Module):
                  train_mode: str = "finetune",
                  formula_fragment_block: dict = None,
                  fragment_contribution_block: dict = None,
-                 fragment_explanation_block: dict = None):
+                 fragment_explanation_block: dict = None,
+                 property_fragment_explanation_block: dict = None):
         super().__init__()
 
         self.graph_embed_block = pretrained_model
@@ -164,10 +166,33 @@ class MolMix(torch.nn.Module):
         self.fragment_explanation_head = (
             ConditionAwareFragmentExplainer(**explanation_config)
             if explanation_enabled else None)
+        property_explanation_config = (
+            {} if property_fragment_explanation_block is None else
+            property_fragment_explanation_block.copy())
+        property_explanation_enabled = property_explanation_config.pop(
+            "enabled", False)
+        property_explanation_freeze_base = property_explanation_config.pop(
+            "freeze_base_formula", False)
+        property_explanation_train_readout = property_explanation_config.pop(
+            "train_readout_pred", False)
         freeze_base_formula = freeze_base_formula or contribution_freeze_base
         train_readout_pred = train_readout_pred or contribution_train_readout
         freeze_base_formula = freeze_base_formula or explanation_freeze_base
         train_readout_pred = train_readout_pred or explanation_train_readout
+        if sum((fragment_enabled, contribution_enabled, explanation_enabled,
+                property_explanation_enabled)) > 1:
+            raise ValueError(
+                "formula_fragment_block, fragment_contribution_block, "
+                "fragment_explanation_block and "
+                "property_fragment_explanation_block are mutually exclusive")
+        self.property_fragment_explanation_head = (
+            ConditionAwarePropertyFragmentExplainer(
+                **property_explanation_config)
+            if property_explanation_enabled else None)
+        freeze_base_formula = (freeze_base_formula
+                               or property_explanation_freeze_base)
+        train_readout_pred = (train_readout_pred
+                              or property_explanation_train_readout)
 
         if freeze_base_formula:
             base_modules = (
@@ -205,6 +230,8 @@ class MolMix(torch.nn.Module):
             self.fragment_contribution_head.reset_parameters()
         if self.fragment_explanation_head is not None:
             self.fragment_explanation_head.reset_parameters()
+        if self.property_fragment_explanation_head is not None:
+            self.property_fragment_explanation_head.reset_parameters()
 
     def get_parameters(self, name=None):
         return self.parameters() if name is None else getattr(
@@ -220,9 +247,22 @@ class MolMix(torch.nn.Module):
                 data.solv_graphs)
             solv_fragment_diagnostics = (
                 self.graph_embed_block.get_fragment_diagnostics())
-            solv_vis = self.graph_embed_block.predict(data.solv_graphs,
-                                                      data.temperature,
-                                                      formula_vis=True)["vis"]
+            base_solv_properties = self.graph_embed_block.predict(
+                data.solv_graphs, data.temperature, formula_vis=True)
+            solv_vis = base_solv_properties["vis"]
+            # The empirical Bamboo path uses its historical reference
+            # viscosity.  The explanation path instead evaluates property
+            # values at each formula's actual temperature without changing
+            # that deployed prediction.
+            solv_properties = base_solv_properties
+            if self.property_fragment_explanation_head is not None:
+                molecule_temperature = data.temperature.repeat_interleave(
+                    data.solv_graphs.counts_mol[:, 0].long())
+                solv_properties = self.graph_embed_block.predict(
+                    data.solv_graphs,
+                    molecule_temperature,
+                    formula_vis=False,
+                )
             salt_node_h, salt_edge_h = self.graph_embed_block._compute_embedding(
                 data.salt_graphs)
             salt_fragment_diagnostics = (
@@ -266,8 +306,10 @@ class MolMix(torch.nn.Module):
 
         fragment_contributions = None
         fragment_explanations = None
+        property_fragment_explanations = None
         if (self.fragment_contribution_head is not None
-                or self.fragment_explanation_head is not None):
+                or self.fragment_explanation_head is not None
+                or self.property_fragment_explanation_head is not None):
             if solv_fragment_diagnostics is None:
                 raise RuntimeError("fragment head requires a fragment-aware "
                                    "molecular encoder")
@@ -294,6 +336,25 @@ class MolMix(torch.nn.Module):
             if self.fragment_explanation_head is not None:
                 fragment_explanations = self.fragment_explanation_head(
                     *fragment_args)
+            if self.property_fragment_explanation_head is not None:
+                property_names = (
+                    self.property_fragment_explanation_head.property_names)
+                solvent_property_h = torch.cat([
+                    solv_properties[name].reshape(-1, 1).to(h_inv)
+                    for name in property_names
+                ], dim=-1)
+                property_fragment_explanations = (
+                    self.property_fragment_explanation_head(
+                        data.solv_graphs,
+                        solv_fragment_diagnostics["fragment_embedding"].to(
+                            h_inv),
+                        solv_fragment_diagnostics["fragment_batch"],
+                        condition_h,
+                        solvent_property_h,
+                        fragment_active=solv_fragment_diagnostics[
+                            "fragment_active"],
+                    ))
+                fragment_explanations = property_fragment_explanations
 
         # Empirical block inputs
         def get_inputs(readout, representation):
@@ -323,9 +384,15 @@ class MolMix(torch.nn.Module):
                 "formula_gates": formula_fragment_gates,
                 "contributions": fragment_contributions,
                 "explanations": fragment_explanations,
+                "property_explanations": property_fragment_explanations,
+                "solvent_properties": {
+                    name: value.detach()
+                    for name, value in solv_properties.items()
+                },
             },
             "fragment_contributions": fragment_contributions,
             "fragment_explanations": fragment_explanations,
+            "property_fragment_explanations": property_fragment_explanations,
         }
         if self.train_mode == "pretrain":
             conductivity_ne = self.empirical_formula_block(

@@ -138,6 +138,15 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
         "explanation_prediction",
         task_data["residual"],
     ).detach().cpu().tolist()
+    property_names = list(task_data.get("property_names", ()))
+    property_sums = task_data.get(
+        "property_sum", torch.zeros_like(task_data["residual"])
+    ).detach().cpu().tolist()
+    property_by_name = task_data.get("property_by_name")
+    if property_by_name is None:
+        property_by_name = torch.empty(
+            (len(property_sums), 0), device=task_data["residual"].device)
+    property_by_name = property_by_name.detach().cpu().tolist()
     output = [{
         "task": task,
         "raw_main_effect_sum_normalized": float(raw_main),
@@ -149,14 +158,24 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
         "attribution_scale": float(scale),
         "residual_bound_normalized": float(bound),
         "condition_reference_normalized": float(reference),
+        "property_sum_normalized": float(property_sum),
+        "property_sum_by_name_normalized": {
+            name: float(value)
+            for name, value in zip(property_names, by_name)
+        },
+        "total_composition_offset_normalized": float(property_sum + residual),
         "explanation_prediction_normalized": float(explanation),
         "total_residual_delta_ln": float(
             residual * LOG_CONDUCTIVITY_SCALE),
-        "conductivity_multiplier": float(math.exp(
+        "fragment_conductivity_multiplier": float(math.exp(
             max(-50.0, min(50.0, residual * LOG_CONDUCTIVITY_SCALE)))),
+        "conductivity_multiplier": float(math.exp(max(
+            -50.0,
+            min(50.0, (property_sum + residual) * LOG_CONDUCTIVITY_SCALE)))),
         "top_fragment_pairs": [],
     } for (raw_main, raw_interaction, raw_residual, value, interaction,
-           residual, scale, bound, reference, explanation) in zip(
+           residual, scale, bound, reference, property_sum, by_name,
+           explanation) in zip(
         raw_main_sums,
         raw_interaction_sums,
         raw_residuals,
@@ -166,6 +185,8 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
         attribution_scales,
         residual_bounds,
         condition_references,
+        property_sums,
+        property_by_name,
         explanation_predictions,
     )]
     if len(output) != formula_count:
@@ -199,6 +220,79 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
                 "fragment_smiles": right_info[4],
             },
         })
+    return output
+
+
+def collect_property_explanations(annotated_metadata, diagnostics,
+                                  molar_ratios=None,
+                                  task="conductivity_explain"):
+    """Serialize per-solvent, signed property terms from the joint head."""
+
+    if diagnostics is None or diagnostics.get("property_explanations") is None:
+        return None
+    contribution_data = diagnostics["property_explanations"]
+    task_data = contribution_data["tasks"][task]
+    property_names = list(task_data.get("property_names", ()))
+    if not property_names:
+        return None
+    values = task_data["property_values"].detach().cpu().tolist()
+    normalized = task_data["property_normalized"].detach().cpu().tolist()
+    effects = task_data["property_molecule_effect"].detach().cpu().tolist()
+    if molar_ratios is None:
+        molar_ratios = [0.0] * len(values)
+    else:
+        molar_ratios = molar_ratios.detach().cpu().reshape(-1).tolist()
+    if len(molar_ratios) != len(values):
+        raise ValueError("property molar-ratio count does not match molecules")
+    formula_count = len(annotated_metadata)
+    output = [{
+        "task": task,
+        "property_names": property_names,
+        "raw_property_sum_normalized": float(raw_sum),
+        "property_sum_normalized": float(property_sum),
+        "property_sum_by_name_normalized": {
+            name: float(value)
+            for name, value in zip(property_names, by_name)
+        },
+        "property_attribution_scale": float(scale),
+        "property_bound_normalized": float(bound),
+        "solvent_property_contributions": [],
+    } for raw_sum, property_sum, by_name, scale, bound in zip(
+        task_data["raw_property_sum"].detach().cpu().tolist(),
+        task_data["property_sum"].detach().cpu().tolist(),
+        task_data["property_by_name"].detach().cpu().tolist(),
+        task_data["property_attribution_scale"].detach().cpu().tolist(),
+        task_data["property_bound"].detach().cpu().tolist(),
+    )]
+    if len(output) != formula_count:
+        raise ValueError("formula property contribution count does not match metadata")
+    offset = 0
+    for formula_index, formula in enumerate(annotated_metadata):
+        for molecule_index, molecule in enumerate(formula):
+            if offset >= len(values):
+                raise ValueError("property contribution is shorter than metadata")
+            output[formula_index]["solvent_property_contributions"].append({
+                "molecule_index": molecule_index,
+                "molecule_name": molecule.get("molecule_name", "unknown"),
+                "molecule_smiles": molecule.get("mapped_smiles", ""),
+                "molar_ratio": float(molar_ratios[offset]),
+                "property_values_normalized": {
+                    name: float(value)
+                    for name, value in zip(property_names, values[offset])
+                },
+                "property_values_centered_scaled": {
+                    name: float(value)
+                    for name, value in zip(property_names, normalized[offset])
+                },
+                "property_effects_normalized": {
+                    name: float(value)
+                    for name, value in zip(property_names, effects[offset])
+                },
+                "total_property_effect_normalized": float(sum(effects[offset])),
+            })
+            offset += 1
+    if offset != len(values):
+        raise ValueError("property contribution is longer than metadata")
     return output
 
 
@@ -246,6 +340,7 @@ def main():
     fragment_attention = []
     fragment_contributions = []
     fragment_explanations = []
+    property_explanations = []
     fragment_gates = None
 
     for batch_idx, graph in enumerate(valid_dl):
@@ -300,6 +395,8 @@ def main():
                 [None] * pred_conductivities.shape[0])
             fragment_explanations.extend(
                 [None] * pred_conductivities.shape[0])
+            property_explanations.extend(
+                [None] * pred_conductivities.shape[0])
         else:
             batch_contributions = collect_fragment_contributions(
                 graph.solv_graphs,
@@ -327,6 +424,16 @@ def main():
                     [None] * pred_conductivities.shape[0])
             else:
                 fragment_explanations.extend(batch_explanations)
+            batch_property_explanations = collect_property_explanations(
+                solvents_attention,
+                fragment_diagnostics,
+                graph.solv_graphs.molar_ratios,
+            )
+            if batch_property_explanations is None:
+                property_explanations.extend(
+                    [None] * pred_conductivities.shape[0])
+            else:
+                property_explanations.extend(batch_property_explanations)
 
         for c in pred_conductivities:
             conductivities_pred.append(c.item())
@@ -405,6 +512,8 @@ def main():
             entry["fragment_contributions"] = fragment_contributions[i]
         if fragment_explanations[i] is not None:
             entry["fragment_explanations"] = fragment_explanations[i]
+        if property_explanations[i] is not None:
+            entry["property_explanations"] = property_explanations[i]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
