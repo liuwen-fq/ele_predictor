@@ -1,0 +1,68 @@
+ckpt_path: "run/fragment_explanation_no_fidelity/ckpt_formula_ft"
+save_dir: "run/data/ft_test"
+output_path: "run/fragment_explanation_no_fidelity/results/ft_test_predictions.json"
+data_cls: "FormulaData"
+key_map:
+  concentration: "salt_molar_ratio"
+  temperature: "temperature"
+
+model:
+  pretrain:
+    model_config:
+      graph_block:
+        feature_layer:
+          atom_embedding_dim: 16
+          node_mlp_dims: [32, 32, 2]
+          edge_mlp_dims: [32, 32, 2]
+          act: gelu
+        gnn_layer:
+          gnn_type: EGT
+          gnn_dims: [32, 32, 3]
+          jk: cat
+          act: gelu
+          heads: 4
+          at_channels: 8
+          ffn_dims: [32, 2]
+        fragment_block:
+          enabled: true
+          mode: sidecar
+          freeze_base: true
+          hidden_dim: 64
+          connection_feature_dim: 9
+          num_message_layers: 1
+          neutral_only: true
+          sidecar_gate_init: 0.0
+          sidecar_gate_scale: 0.1
+      readout_block:
+        input_dim: 64
+        hidden_dims: [256, 128, 16]
+        output_dim: 1
+  model:
+    train_mode: finetune
+    aggr_block:
+      node_emb_dim: 32
+      node_att_dim: 32
+      edge_emb_dim: 32
+      edge_att_dim: 32
+    readout_block:
+      input_dim: 384
+      hidden_dims: [512, 128, 16]
+      output_dim: 1
+    anion_block:
+      input_dim: 400
+      hidden_dims: [512, 128, 16]
+      output_dim: 1
+    fragment_explanation_block:
+      enabled: true
+      input_dim: 64
+      condition_input_dim: 130
+      hidden_dim: 64
+      main_rank: 16
+      pair_rank: 8
+      main_scale: 0.1
+      interaction_scale: 0.05
+      residual_bound: 0.2
+      cross_molecule_only: true
+      diagnostic_top_k_pairs: -1
+      freeze_base_formula: true
+      train_readout_pred: false
