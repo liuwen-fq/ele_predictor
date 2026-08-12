@@ -21,7 +21,9 @@ RUN_DIR="run/property_fragment_explanation"
 CKPT_DIR="$RUN_DIR/ckpt_formula_ft"
 RESULT="$RUN_DIR/results/ft_test_predictions.json"
 ARTIFACT_DIR="${ARTIFACT_DIR:-run/property_fragment_explanation_artifacts}"
-ATTRIBUTION_DIR="${ATTRIBUTION_DIR:-run/property_fragment_attribution}"
+# Keep the upgraded motif/concentration report separate from the historical
+# fragment-only artifact directory.  Users can still override this path.
+ATTRIBUTION_DIR="${ATTRIBUTION_DIR:-run/property_fragment_attribution_v2}"
 
 prepare_checkpoints() {
     for file in "$SOURCE_BAMBOO_MONO" "$SOURCE_BAMBOO_FT" "$SOURCE_FRAGMENT_MONO"; do

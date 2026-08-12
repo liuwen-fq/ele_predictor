@@ -57,7 +57,7 @@ bash submit/run_property_fragment_explanation_pipeline.sh explain
 ```text
 run/property_fragment_explanation/results/ft_test_predictions.json
 run/property_fragment_explanation_artifacts/properties/
-run/property_fragment_attribution/
+run/property_fragment_attribution_v2/
 ```
 
 每个配方 JSON 同时包括：
@@ -66,5 +66,8 @@ run/property_fragment_attribution/
 - `conductivity_explain_pred`：条件基准、性质项与片段项的可加和解释预测；
 - `property_explanations`：`dc`、`vis`、`Tm` 的配方级和逐溶剂性质贡献；
 - `fragment_explanations`：片段主贡献及跨溶剂片段对交互。
+
+归因目录的主报告 `fragment_attribution_report_zh.md` 还会给出：按化学基元
+归并的片段结论、已观测的条件化浓度窗口，以及冻结分子模型的性质机制诊断。
 
 详见 [电导率配方解释方案.md](电导率配方解释方案.md)。

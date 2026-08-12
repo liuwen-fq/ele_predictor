@@ -296,6 +296,59 @@ def collect_property_explanations(annotated_metadata, diagnostics,
     return output
 
 
+def collect_molecular_property_profiles(annotated_metadata, diagnostics,
+                                        molar_ratios=None):
+    """Serialize all frozen molecular-property predictions per solvent.
+
+    The three properties used by the explanation head (``dc``, ``vis`` and
+    ``Tm``) remain separately attributed in ``property_explanations``.  This
+    diagnostic export intentionally includes every multitask property so that
+    the report can describe supporting trends such as density, surface tension
+    or volatility without falsely presenting them as trained conductivity
+    contribution terms.
+    """
+
+    if diagnostics is None:
+        return None
+    property_data = diagnostics.get("solvent_properties")
+    if not property_data:
+        return None
+    property_names = sorted(property_data)
+    values = {
+        name: tensor.detach().cpu().reshape(-1).tolist()
+        for name, tensor in property_data.items()
+    }
+    molecule_count = len(next(iter(values.values())))
+    if any(len(items) != molecule_count for items in values.values()):
+        raise ValueError("molecular property lengths do not match")
+    if molar_ratios is None:
+        molar_ratios = [0.0] * molecule_count
+    else:
+        molar_ratios = molar_ratios.detach().cpu().reshape(-1).tolist()
+    if len(molar_ratios) != molecule_count:
+        raise ValueError("molecular-property molar-ratio count does not match")
+
+    output = [[] for _ in annotated_metadata]
+    offset = 0
+    for formula_index, formula in enumerate(annotated_metadata):
+        for molecule_index, molecule in enumerate(formula):
+            if offset >= molecule_count:
+                raise ValueError("molecular property profile is shorter than metadata")
+            output[formula_index].append({
+                "molecule_index": molecule_index,
+                "molecule_name": molecule.get("molecule_name", "unknown"),
+                "molecule_smiles": molecule.get("mapped_smiles", ""),
+                "molar_ratio": float(molar_ratios[offset]),
+                "property_values_normalized": {
+                    name: float(values[name][offset]) for name in property_names
+                },
+            })
+            offset += 1
+    if offset != molecule_count:
+        raise ValueError("molecular property profile is longer than metadata")
+    return output
+
+
 def main():
 
     parser = argparse.ArgumentParser(description='test local')
@@ -341,6 +394,7 @@ def main():
     fragment_contributions = []
     fragment_explanations = []
     property_explanations = []
+    molecular_property_profiles = []
     fragment_gates = None
 
     for batch_idx, graph in enumerate(valid_dl):
@@ -397,6 +451,8 @@ def main():
                 [None] * pred_conductivities.shape[0])
             property_explanations.extend(
                 [None] * pred_conductivities.shape[0])
+            molecular_property_profiles.extend(
+                [None] * pred_conductivities.shape[0])
         else:
             batch_contributions = collect_fragment_contributions(
                 graph.solv_graphs,
@@ -434,6 +490,16 @@ def main():
                     [None] * pred_conductivities.shape[0])
             else:
                 property_explanations.extend(batch_property_explanations)
+            batch_property_profiles = collect_molecular_property_profiles(
+                solvents_attention,
+                fragment_diagnostics,
+                graph.solv_graphs.molar_ratios,
+            )
+            if batch_property_profiles is None:
+                molecular_property_profiles.extend(
+                    [None] * pred_conductivities.shape[0])
+            else:
+                molecular_property_profiles.extend(batch_property_profiles)
 
         for c in pred_conductivities:
             conductivities_pred.append(c.item())
@@ -514,6 +580,8 @@ def main():
             entry["fragment_explanations"] = fragment_explanations[i]
         if property_explanations[i] is not None:
             entry["property_explanations"] = property_explanations[i]
+        if molecular_property_profiles[i] is not None:
+            entry["molecular_property_profiles"] = molecular_property_profiles[i]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
