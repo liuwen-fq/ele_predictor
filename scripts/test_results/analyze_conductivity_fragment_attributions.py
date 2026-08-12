@@ -1233,41 +1233,130 @@ def make_motif_property_figures(output_dir: Path,
 
 
 def make_concentration_window_figure(output_dir: Path,
+                                     samples: list[dict[str, Any]],
                                      windows: list[dict[str, Any]]) -> None:
-    """Visualize observed high-prediction concentration-window coverage."""
+    """Show observed concentration--prediction response in each context.
 
-    width, label_width, row_height = 1800, 560, 42
-    height = max(230, 112 + len(windows) * row_height)
-    max_concentration = max((float(row["concentration_high"]) for row in windows),
-                            default=0.1) * 1.10
-    plot_left, plot_width, y0 = label_width, 850, 60
-    elements = [svg_text(width / 2, 23,
-                         "Observed global-high concentration windows",
-                         16, "middle", "bold"),
-                svg_text(plot_left, 49, "0", 9),
-                svg_text(plot_left + plot_width, 49,
-                         f"{max_concentration:.3f}", 9, "end"),
-                svg_text(plot_left + plot_width / 2, height - 14,
-                         "salt_molar_ratio = n_salt / (n_salt + n_solvent)",
-                         11, "middle")]
-    for index, row in enumerate(windows):
-        y = y0 + index * row_height
-        start = plot_left + float(row["concentration_low"]) / max_concentration * plot_width
-        end = plot_left + float(row["concentration_high"]) / max_concentration * plot_width
-        midpoint = (start + end) / 2
-        label = (f'{row["salt_context"]}, {row["temperature_context"]}, '
-                 f'{row["solvent_context"]}')
-        elements.append(svg_text(label_width - 12, y + 4, short_text(label, 70),
-                                 10, "end"))
-        elements.append(f'<line x1="{plot_left}" y1="{y:.1f}" '
-                        f'x2="{plot_left + plot_width}" y2="{y:.1f}" stroke="#eeeeee"/>')
-        elements.append(f'<line x1="{start:.1f}" y1="{y:.1f}" '
-                        f'x2="{end:.1f}" y2="{y:.1f}" stroke="#6f4ca0" stroke-width="8"/>')
-        elements.append(f'<circle cx="{midpoint:.1f}" cy="{y:.1f}" r="5" '
-                        'fill="#24143f"/>')
-        elements.append(svg_text(plot_left + plot_width + 16, y + 4,
-                                 f'mean Bamboo={float(row["mean_bamboo_prediction_ms_cm"]):.2f} mS/cm',
-                                 10))
+    The previous interval-only graphic could look like a conductivity
+    distribution.  This replaces it with small multiples: x is concentration,
+    y is the Bamboo prediction, grey is every observed point in that context,
+    and red/shading identifies the selected high-prediction window.
+    """
+
+    windows_by_context: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for window in windows:
+        key = (window["salt_context"], window["solvent_context"],
+               window["temperature_context"])
+        windows_by_context[key].append(window)
+    observations: dict[tuple[str, str, str], list[dict[str, float]]] = defaultdict(list)
+    for sample in samples:
+        salt, solvent, temperature, _ = _condition_context(sample)
+        key = (salt, solvent, temperature)
+        if key in windows_by_context:
+            observations[key].append({
+                "concentration": float(sample["concentration"]),
+                "prediction": float(sample["bamboo_prediction_ms_cm"]),
+            })
+
+    panels = [(key, windows_by_context[key], observations[key])
+              for key in windows_by_context]
+    panels.sort(key=lambda item: -max(
+        float(window["mean_bamboo_prediction_ms_cm"]) for window in item[1]))
+    columns, panel_width, panel_height = 4, 470, 280
+    rows = max(1, math.ceil(len(panels) / columns))
+    width, height = columns * panel_width + 30, rows * panel_height + 80
+    elements = [
+        svg_text(width / 2, 23,
+                 "Observed concentration--conductivity response in global-high contexts",
+                 16, "middle", "bold"),
+        svg_text(16, 43,
+                 "grey: all observed samples in the same binned condition; red: selected global-high window; line joins concentration-bin means",
+                 10),
+        svg_text(width - 16, 43, "Each panel has its own y scale (mS/cm).", 10,
+                 "end"),
+    ]
+    for panel_index, (key, context_windows, context_observations) in enumerate(panels):
+        column, row = panel_index % columns, panel_index // columns
+        panel_x, panel_y = 15 + column * panel_width, 60 + row * panel_height
+        chart_left, chart_right = panel_x + 58, panel_x + panel_width - 18
+        chart_top, chart_bottom = panel_y + 68, panel_y + panel_height - 44
+        salt, solvent, temperature = key
+        title = f"{salt} | {temperature}"
+        elements.append(f'<rect x="{panel_x}" y="{panel_y}" width="{panel_width - 8}" '
+                        f'height="{panel_height - 10}" fill="#ffffff" stroke="#bbbbbb"/>')
+        elements.append(svg_text(panel_x + (panel_width - 8) / 2, panel_y + 17,
+                                 short_text(title, 44), 11, "middle", "bold"))
+        elements.append(svg_text(panel_x + (panel_width - 8) / 2, panel_y + 33,
+                                 short_text(solvent, 48), 10, "middle"))
+        if not context_observations:
+            elements.append(svg_text(panel_x + panel_width / 2, panel_y + 125,
+                                     "No observations", 11, "middle"))
+            continue
+        concentration_values = [item["concentration"] for item in context_observations]
+        prediction_values = [item["prediction"] for item in context_observations]
+        x_min, x_max = min(concentration_values), max(concentration_values)
+        y_min, y_max = min(prediction_values), max(prediction_values)
+        x_pad = max((x_max - x_min) * 0.10, 0.005)
+        y_pad = max((y_max - y_min) * 0.12, 0.25)
+        x_min, x_max = max(0.0, x_min - x_pad), x_max + x_pad
+        y_min, y_max = max(0.0, y_min - y_pad), y_max + y_pad
+        x_scale = (chart_right - chart_left) / max(x_max - x_min, 1e-12)
+        y_scale = (chart_bottom - chart_top) / max(y_max - y_min, 1e-12)
+        def point_x(value: float) -> float:
+            return chart_left + (value - x_min) * x_scale
+        def point_y(value: float) -> float:
+            return chart_bottom - (value - y_min) * y_scale
+        for window in context_windows:
+            shade_left = point_x(float(window["concentration_low"]))
+            shade_right = point_x(float(window["concentration_high"]))
+            elements.append(f'<rect x="{shade_left:.1f}" y="{chart_top:.1f}" '
+                            f'width="{max(1.0, shade_right - shade_left):.1f}" '
+                            f'height="{chart_bottom - chart_top:.1f}" '
+                            'fill="#f6caca" fill-opacity="0.45"/>')
+        for guide_fraction in (0.0, 0.5, 1.0):
+            y = chart_bottom - guide_fraction * (chart_bottom - chart_top)
+            value = y_min + guide_fraction * (y_max - y_min)
+            elements.append(f'<line x1="{chart_left:.1f}" y1="{y:.1f}" '
+                            f'x2="{chart_right:.1f}" y2="{y:.1f}" stroke="#e7e7e7"/>')
+            elements.append(svg_text(chart_left - 5, y + 3, f"{value:.2f}", 8,
+                                     "end"))
+        by_concentration: dict[float, list[float]] = defaultdict(list)
+        for observation in context_observations:
+            by_concentration[round(observation["concentration"], 6)].append(
+                observation["prediction"])
+        mean_points = [(concentration, finite_mean(values) or 0.0)
+                       for concentration, values in sorted(by_concentration.items())]
+        polyline = " ".join(
+            f"{point_x(concentration):.1f},{point_y(prediction):.1f}"
+            for concentration, prediction in mean_points)
+        elements.append(f'<polyline points="{polyline}" fill="none" '
+                        'stroke="#8c8c8c" stroke-width="1.4"/>')
+        def in_selected_window(concentration: float) -> bool:
+            return any(float(window["concentration_low"]) - 1e-6 <= concentration <=
+                       float(window["concentration_high"]) + 1e-6
+                       for window in context_windows)
+        for concentration, prediction in mean_points:
+            x, y = point_x(concentration), point_y(prediction)
+            selected = in_selected_window(concentration)
+            color = "#c74343" if selected else "#777777"
+            radius = 5 if selected else 3.5
+            elements.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" '
+                            f'fill="{color}" stroke="white" stroke-width="1"/>')
+        elements.append(f'<line x1="{chart_left:.1f}" y1="{chart_bottom:.1f}" '
+                        f'x2="{chart_right:.1f}" y2="{chart_bottom:.1f}" stroke="#222"/>')
+        elements.append(f'<line x1="{chart_left:.1f}" y1="{chart_top:.1f}" '
+                        f'x2="{chart_left:.1f}" y2="{chart_bottom:.1f}" stroke="#222"/>')
+        elements.append(svg_text(chart_left, chart_bottom + 16, f"{x_min:.3f}", 8))
+        elements.append(svg_text(chart_right, chart_bottom + 16, f"{x_max:.3f}", 8,
+                                 "end"))
+        elements.append(svg_text((chart_left + chart_right) / 2, chart_bottom + 30,
+                                 "salt_molar_ratio", 9, "middle"))
+        mean_prediction = finite_mean(
+            float(window["mean_bamboo_prediction_ms_cm"])
+            for window in context_windows)
+        elements.append(svg_text(chart_right, panel_y + 52,
+                                 f"window mean={mean_prediction:.2f} mS/cm", 9,
+                                 "end", "bold"))
     write_svg(output_dir / "global_high_concentration_windows.svg", width,
               height, elements)
 
@@ -1367,6 +1456,7 @@ def make_plots(output_dir: Path, fragment_rows: list[dict[str, Any]],
                pair_rows: list[dict[str, Any]],
                motif_property_rows: list[dict[str, Any]],
                global_windows: list[dict[str, Any]],
+               samples: list[dict[str, Any]],
                min_formulas: int) -> None:
     """Write dependency-free SVG figures with concise formula/solvent labels."""
     high_fragments = candidates(fragment_rows, "high", min_formulas,
@@ -1444,7 +1534,7 @@ def make_plots(output_dir: Path, fragment_rows: list[dict[str, Any]],
               width, height, elements)
     make_motif_property_figures(output_dir, high_fragments, low_fragments,
                                 motif_property_rows)
-    make_concentration_window_figure(output_dir, global_windows)
+    make_concentration_window_figure(output_dir, samples, global_windows)
 
 
 def make_report(samples: list[dict[str, Any]], low_cutoff: float,
@@ -1597,7 +1687,7 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "",
         "![化学基元承载溶剂的物性直接贡献](motif_carrier_property_terms.svg)",
         "",
-        "**图 6：全局高预测浓度窗口。** 横线为已观测、且通过全测试集高预测与方向稳定性筛选的 `salt_molar_ratio` 覆盖范围；深色点位于范围中点，仅作视觉定位，不代表预测最优浓度。右侧数字是窗口内平均 Bamboo 主预测。",
+        "**图 6：全局高预测体系的浓度—电导率响应。** 每个小面板固定一个盐组成、温度邻域和溶剂比例上下文。横轴为 `salt_molar_ratio`，纵轴为该上下文中各观测浓度点的 Bamboo 主预测（mS/cm）；灰点及灰线表示全部观测浓度点及其按浓度汇总的均值，红点与浅红阴影表示最终筛出的全局高预测窗口。连线只连接观测点，不表示对中间浓度的插值。为看清各体系内部的变化趋势，每个面板采用独立纵轴，面板右上角的 `window mean` 用于跨体系比较绝对预测水平。",
         "",
         "![全局高预测浓度窗口](global_high_concentration_windows.svg)",
         "",
@@ -1703,7 +1793,7 @@ def main() -> None:
     (output_dir / "analysis_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
     make_plots(output_dir, motif_rows, pair_rows, motif_property_rows,
-               global_windows, args.min_formulas)
+               global_windows, samples, args.min_formulas)
     (output_dir / "fragment_attribution_report_zh.md").write_text(
         make_report(samples, low_cutoff, high_cutoff, motif_rows, pair_rows,
                     property_rows, motif_property_rows, contexts,
