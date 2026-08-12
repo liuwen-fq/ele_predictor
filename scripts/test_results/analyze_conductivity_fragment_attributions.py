@@ -677,6 +677,11 @@ def summarize_motif_property_profiles(rows: list[dict[str, Any]]) -> list[dict[s
                 row[f"{group_name}_{name}_effect_normalized"] = finite_mean(
                     item["effects"].get(name, float("nan"))
                     for item in group_rows)
+        for group_name, group_rows in (("high", high), ("low", low)):
+            row[f"{group_name}_property_effect_total_normalized"] = finite_mean(
+                sum(item["effects"].get(name, 0.0)
+                    for name in ("dc", "vis", "Tm"))
+                for item in group_rows)
         output.append(row)
     return output
 
@@ -697,6 +702,41 @@ def _condition_context(sample: dict[str, Any]) -> tuple[str, str, str, float]:
     solvents = _component_signature(record.get("solvents", []))
     temperature_bin = round(sample["temperature_c"] / 5.0) * 5.0
     return salts, solvents, f"{temperature_bin:.0f} °C 邻域", temperature_bin
+
+
+def _signature_ratios(signature: str) -> list[tuple[str, float]]:
+    """Parse a binned component signature such as ``DEC:0.25+PC:0.75``."""
+
+    values = []
+    for token in signature.split("+"):
+        name, separator, ratio = token.rpartition(":")
+        if separator:
+            values.append((name, float(ratio)))
+    return values
+
+
+def _whole_mixture_mole_fraction_endpoints(salt_context: str,
+                                           solvent_context: str,
+                                           concentration_low: float,
+                                           concentration_high: float) -> str:
+    """Format approximate total-mixture mole fractions at both c endpoints.
+
+    Solvent and salt ratios are normalized within their own groups.  The
+    concentration field is the total salt mole fraction, so it supplies the
+    missing bridge between the two groups.
+    """
+
+    salts = _signature_ratios(salt_context)
+    solvents = _signature_ratios(solvent_context)
+
+    def endpoint(concentration: float) -> str:
+        values = [(name, concentration * ratio) for name, ratio in salts]
+        values += [(name, (1.0 - concentration) * ratio)
+                   for name, ratio in solvents]
+        return ", ".join(f"{name}:{value:.4f}" for name, value in values)
+
+    return f"c={concentration_low:.4f}: {endpoint(concentration_low)}; " \
+           f"c={concentration_high:.4f}: {endpoint(concentration_high)}"
 
 
 def _direction(values: list[float], tolerance: float = 0.002) -> str:
@@ -821,6 +861,10 @@ def concentration_windows(samples: list[dict[str, Any]], min_points: int = 3
                 "local_high_prediction_threshold_ms_cm": local_high,
                 "global_high_prediction_threshold_ms_cm": global_high,
             }
+            item["whole_mixture_mole_fraction_endpoints"] = (
+                _whole_mixture_mole_fraction_endpoints(
+                    salts, solvents, item["concentration_low"],
+                    item["concentration_high"]))
             # A strict global recommendation requires every observed point in
             # the window to clear the test-set-wide 75th percentile.  The
             # remaining windows are still valuable for concentration scans,
@@ -903,6 +947,7 @@ def concentration_window_table(rows: list[dict[str, Any]],
         short_text(row["temperature_context"], 14),
         short_text(row["solvent_context"], 44),
         f'{number(row["concentration_low"], 4)} – {number(row["concentration_high"], 4)}',
+        short_text(row["whole_mixture_mole_fraction_endpoints"], 82),
         str(row["distinct_concentration_count"]),
         number(row["mean_bamboo_prediction_ms_cm"], 3),
         "/".join([
@@ -912,7 +957,8 @@ def concentration_window_table(rows: list[dict[str, Any]],
     ] for row in rows[:limit]]
     return markdown_table([
         "盐组成（比例 0.05 分箱）", "温度", "溶剂组成（比例 0.05 分箱）",
-        "建议扫描范围（高预测观测点 min–max；salt_molar_ratio）", "浓度点数", "平均 Bamboo 预测 (mS/cm)",
+        "建议扫描范围（高预测观测点 min–max；salt_molar_ratio）",
+        "全混合物摩尔分数端点（近似）", "浓度点数", "平均 Bamboo 预测 (mS/cm)",
         "dc / 黏度 / 片段方向稳定性",
     ], table_rows)
 
@@ -959,10 +1005,13 @@ def motif_property_table(high_motifs: list[dict[str, Any]],
                 number(profile[f"{prefix}_Tm_physical"], 1),
                 "/".join(number(profile[f"{prefix}_{name}_effect_normalized"], 3)
                          for name in ("dc", "vis", "Tm")),
+                number(profile[
+                    f"{prefix}_property_effect_total_normalized"], 3),
             ])
     return markdown_table([
         "电导率组", "化学基元", "承载该基元的溶剂", "介电常数 εr",
-        "黏度 (mPa·s)", "熔点 (°C)", "dc / vis / Tm 直接贡献",
+        "黏度 (mPa·s)", "熔点 (°C)", "dc / vis / Tm 物性项",
+        "物性项合计",
     ], table_rows)
 
 
@@ -1017,6 +1066,210 @@ def write_svg(path: Path, width: int, height: int, elements: list[str]) -> None:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">\n<rect width="100%" height="100%" '
         'fill="white"/>\n' + "\n".join(elements) + "\n</svg>\n")
+
+
+def motif_profile_plot_rows(high_motifs: list[dict[str, Any]],
+                            low_motifs: list[dict[str, Any]],
+                            profiles: list[dict[str, Any]],
+                            limit_each: int = 12) -> list[dict[str, Any]]:
+    """Return plotted motif rows with their group-specific carrier profile."""
+
+    profile_by_key = {row["motif_key"]: row for row in profiles}
+    output = []
+    for group, motifs in (("High", high_motifs[:limit_each]),
+                          ("Low", low_motifs[:limit_each])):
+        prefix = group.lower()
+        for motif in motifs:
+            profile = profile_by_key.get(motif["motif_key"])
+            if profile is None:
+                continue
+            carriers = str(profile["carrier_solvents"]).split("；")
+            carrier_text = "+".join(carriers[:2])
+            if len(carriers) > 2:
+                carrier_text += "+…"
+            output.append({
+                "group": group,
+                "label": f'{motif["fragment_group_formula"]} | {carrier_text}',
+                **{name: profile.get(f"{prefix}_{name}_physical")
+                   for name in ("dc", "vis", "Tm")},
+                **{f"{name}_effect": profile.get(
+                    f"{prefix}_{name}_effect_normalized")
+                   for name in ("dc", "vis", "Tm")},
+            })
+    return output
+
+
+def _finite_plot_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    return [float(row[key]) for row in rows
+            if row.get(key) is not None and math.isfinite(float(row[key]))]
+
+
+def property_profile_dot_panel(rows: list[dict[str, Any]], key: str,
+                               title: str, x0: float, y0: float,
+                               width: float, row_height: float) -> list[str]:
+    """Draw one physical-property dot panel with an independent x scale."""
+
+    values = _finite_plot_values(rows, key)
+    if not values:
+        return [svg_text(x0 + width / 2, y0 + 25, title, 13, "middle", "bold")]
+    value_min, value_max = min(values), max(values)
+    padding = max((value_max - value_min) * 0.10, 0.1)
+    value_min -= padding
+    value_max += padding
+    scale = width / max(value_max - value_min, 1e-12)
+    lines = [svg_text(x0 + width / 2, y0 + 20, title, 13, "middle", "bold"),
+             f'<line x1="{x0:.1f}" y1="{y0 + 34:.1f}" '
+             f'x2="{x0 + width:.1f}" y2="{y0 + 34:.1f}" stroke="#333"/>',
+             svg_text(x0, y0 + 48, f"{value_min:.2f}", 9),
+             svg_text(x0 + width, y0 + 48, f"{value_max:.2f}", 9, "end")]
+    for index, row in enumerate(rows):
+        value = row.get(key)
+        if value is None or not math.isfinite(float(value)):
+            continue
+        y = y0 + 72 + index * row_height
+        x = x0 + (float(value) - value_min) * scale
+        color = "#c74343" if row["group"] == "High" else "#356ea2"
+        lines.append(f'<line x1="{x0:.1f}" y1="{y:.1f}" x2="{x0 + width:.1f}" '
+                     f'y2="{y:.1f}" stroke="#eeeeee"/>')
+        lines.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="{color}"/>')
+        lines.append(svg_text(x + 8, y + 3, f"{float(value):.2f}", 9))
+    return lines
+
+
+def property_effect_bar_panel(rows: list[dict[str, Any]], key: str,
+                              title: str, x0: float, y0: float,
+                              width: float, row_height: float,
+                              max_abs: float) -> list[str]:
+    """Draw signed, bounded-scale direct property-attribution bars."""
+
+    zero_x = x0 + width / 2
+    scale = (width / 2 - 12) / max(max_abs, 1e-8)
+    lines = [svg_text(x0 + width / 2, y0 + 20, title, 13, "middle", "bold"),
+             f'<line x1="{zero_x:.1f}" y1="{y0 + 34:.1f}" '
+             f'x2="{zero_x:.1f}" y2="{y0 + 60 + len(rows) * row_height:.1f}" '
+             'stroke="#222"/>',
+             svg_text(x0, y0 + 48, f"−{max_abs:.2f}", 9),
+             svg_text(zero_x, y0 + 48, "0", 9, "middle"),
+             svg_text(x0 + width, y0 + 48, f"+{max_abs:.2f}", 9, "end")]
+    for index, row in enumerate(rows):
+        value = float(row.get(f"{key}_effect") or 0.0)
+        y = y0 + 72 + index * row_height
+        bar_width = abs(value) * scale
+        x = zero_x if value >= 0 else zero_x - bar_width
+        color = "#c74343" if value >= 0 else "#356ea2"
+        lines.append(f'<rect x="{x:.1f}" y="{y - 6:.1f}" width="{bar_width:.1f}" '
+                     f'height="12" fill="{color}"/>')
+        lines.append(svg_text(x + bar_width + 4 if value >= 0 else x - 4,
+                              y + 3, f"{value:.3f}", 8,
+                              "start" if value >= 0 else "end"))
+    return lines
+
+
+def make_motif_property_figures(output_dir: Path,
+                                high_motifs: list[dict[str, Any]],
+                                low_motifs: list[dict[str, Any]],
+                                profiles: list[dict[str, Any]]) -> None:
+    """Write physical-property and signed-property-term motif figures."""
+
+    rows = motif_profile_plot_rows(high_motifs, low_motifs, profiles)
+    row_height, label_width = 42, 440
+    height, width, y0 = max(250, 105 + len(rows) * row_height), 1900, 34
+    labels = [svg_text(width / 2, 22,
+                       "Carrier-solvent physical properties by chemical motif",
+                       16, "middle", "bold"),
+              svg_text(16, 42, "red: high-conductivity group; blue: low-conductivity group", 10)]
+    for index, row in enumerate(rows):
+        y = y0 + 72 + index * row_height
+        color = "#c74343" if row["group"] == "High" else "#356ea2"
+        labels.append(svg_text(label_width - 10, y + 3,
+                               f'{row["group"]}: {row["label"]}', 10,
+                               "end", "bold"))
+    high_count = sum(row["group"] == "High" for row in rows)
+    if 0 < high_count < len(rows):
+        separator_y = y0 + 72 + (high_count - 0.5) * row_height
+        labels.append(f'<line x1="15" y1="{separator_y:.1f}" x2="{width - 15}" '
+                      f'y2="{separator_y:.1f}" stroke="#999" stroke-dasharray="4,3"/>')
+    panels = [
+        property_profile_dot_panel(rows, "dc", "Dielectric constant εr",
+                                   470, y0, 410, row_height),
+        property_profile_dot_panel(rows, "vis", "Viscosity (mPa·s)",
+                                   970, y0, 410, row_height),
+        property_profile_dot_panel(rows, "Tm", "Melting point (°C)",
+                                   1470, y0, 410, row_height),
+    ]
+    write_svg(output_dir / "motif_carrier_solvent_property_profiles.svg",
+              width, height, labels + panels[0] + panels[1] + panels[2])
+
+    effect_values = [abs(value) for key in ("dc_effect", "vis_effect", "Tm_effect")
+                     for value in _finite_plot_values(rows, key)]
+    max_abs = max(effect_values, default=0.01)
+    effect_title = [svg_text(width / 2, 22,
+                             "Signed property terms of carrier solvents by motif",
+                             16, "middle", "bold"),
+                    svg_text(16, 42,
+                             "Each bar is a normalized log-conductivity term, not a percentage.",
+                             10)]
+    effect_labels = []
+    for index, row in enumerate(rows):
+        y = y0 + 72 + index * row_height
+        effect_labels.append(svg_text(label_width - 10, y + 3,
+                                      f'{row["group"]}: {row["label"]}', 10,
+                                      "end", "bold"))
+    if 0 < high_count < len(rows):
+        separator_y = y0 + 72 + (high_count - 0.5) * row_height
+        effect_labels.append(f'<line x1="15" y1="{separator_y:.1f}" x2="{width - 15}" '
+                             f'y2="{separator_y:.1f}" stroke="#999" stroke-dasharray="4,3"/>')
+    effect_panels = [
+        property_effect_bar_panel(rows, "dc", "dc term", 470, y0, 410,
+                                  row_height, max_abs),
+        property_effect_bar_panel(rows, "vis", "vis term", 970, y0, 410,
+                                  row_height, max_abs),
+        property_effect_bar_panel(rows, "Tm", "Tm term", 1470, y0, 410,
+                                  row_height, max_abs),
+    ]
+    write_svg(output_dir / "motif_carrier_property_terms.svg", width, height,
+              effect_title + effect_labels + effect_panels[0] +
+              effect_panels[1] + effect_panels[2])
+
+
+def make_concentration_window_figure(output_dir: Path,
+                                     windows: list[dict[str, Any]]) -> None:
+    """Visualize observed high-prediction concentration-window coverage."""
+
+    width, label_width, row_height = 1800, 560, 42
+    height = max(230, 112 + len(windows) * row_height)
+    max_concentration = max((float(row["concentration_high"]) for row in windows),
+                            default=0.1) * 1.10
+    plot_left, plot_width, y0 = label_width, 850, 60
+    elements = [svg_text(width / 2, 23,
+                         "Observed global-high concentration windows",
+                         16, "middle", "bold"),
+                svg_text(plot_left, 49, "0", 9),
+                svg_text(plot_left + plot_width, 49,
+                         f"{max_concentration:.3f}", 9, "end"),
+                svg_text(plot_left + plot_width / 2, height - 14,
+                         "salt_molar_ratio = n_salt / (n_salt + n_solvent)",
+                         11, "middle")]
+    for index, row in enumerate(windows):
+        y = y0 + index * row_height
+        start = plot_left + float(row["concentration_low"]) / max_concentration * plot_width
+        end = plot_left + float(row["concentration_high"]) / max_concentration * plot_width
+        midpoint = (start + end) / 2
+        label = (f'{row["salt_context"]}, {row["temperature_context"]}, '
+                 f'{row["solvent_context"]}')
+        elements.append(svg_text(label_width - 12, y + 4, short_text(label, 70),
+                                 10, "end"))
+        elements.append(f'<line x1="{plot_left}" y1="{y:.1f}" '
+                        f'x2="{plot_left + plot_width}" y2="{y:.1f}" stroke="#eeeeee"/>')
+        elements.append(f'<line x1="{start:.1f}" y1="{y:.1f}" '
+                        f'x2="{end:.1f}" y2="{y:.1f}" stroke="#6f4ca0" stroke-width="8"/>')
+        elements.append(f'<circle cx="{midpoint:.1f}" cy="{y:.1f}" r="5" '
+                        'fill="#24143f"/>')
+        elements.append(svg_text(plot_left + plot_width + 16, y + 4,
+                                 f'mean Bamboo={float(row["mean_bamboo_prediction_ms_cm"]):.2f} mS/cm',
+                                 10))
+    write_svg(output_dir / "global_high_concentration_windows.svg", width,
+              height, elements)
 
 
 def svg_bar_panel(rows: list[dict[str, Any]], effect_key: str, label_fn,
@@ -1111,7 +1364,10 @@ def non_overlapping_scatter_labels(selected: list[dict[str, Any]],
 
 
 def make_plots(output_dir: Path, fragment_rows: list[dict[str, Any]],
-               pair_rows: list[dict[str, Any]], min_formulas: int) -> None:
+               pair_rows: list[dict[str, Any]],
+               motif_property_rows: list[dict[str, Any]],
+               global_windows: list[dict[str, Any]],
+               min_formulas: int) -> None:
     """Write dependency-free SVG figures with concise formula/solvent labels."""
     high_fragments = candidates(fragment_rows, "high", min_formulas,
                                 "high_mean_main_effect_normalized")
@@ -1186,6 +1442,9 @@ def make_plots(output_dir: Path, fragment_rows: list[dict[str, Any]],
     elements.extend(non_overlapping_scatter_labels(selected, coordinates))
     write_svg(output_dir / "fragment_enrichment_vs_direct_contribution.svg",
               width, height, elements)
+    make_motif_property_figures(output_dir, high_fragments, low_fragments,
+                                motif_property_rows)
+    make_concentration_window_figure(output_dir, global_windows)
 
 
 def make_report(samples: list[dict[str, Any]], low_cutoff: float,
@@ -1236,7 +1495,7 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "- **协同/拮抗（interaction effect）**：来自不同溶剂分子的两个片段同时出现时的额外有符号项。正值是模型正协同候选，负值是模型负协同/拮抗候选；片段对表按对应高/低组内平均交互绝对值排序，不再优先按出现次数排序。",
         "- **条件基准**：盐组成、数据集盐浓度标量（源字段 `salt_molar_ratio`）和温度所给出的参考电导率。片段项描述的是相对于该基准的组成差异，不是盐效应本身。",
         "- **盐/溶剂组成比例**：`LiTFSI:1.00` 表示 LiTFSI 占该样本**盐混合物内部**的 100%；`AN:1.00` 表示 AN 占该样本**溶剂混合物内部**的 100%。两者不构成盐:溶剂 = 1:1。",
-        "- **数据集盐浓度标量（`salt_molar_ratio`）**：这是原始配方记录中的独立输入字段。预处理代码未保存其到 mol/L 或盐/溶剂摩尔数的换算式，因此本报告只将其用作同一数据集内的相对扫描坐标，不能标为物理摩尔浓度。",
+        "- **数据集盐摩尔分数（`salt_molar_ratio = c`）**：预处理文档定义 `c = n_salt / (n_salt + n_solvent)`。故盐 i 的全混合物摩尔分数为 `x_salt,i = c × r_salt,i`，溶剂 j 的全混合物摩尔分数为 `x_solvent,j = (1−c) × r_solvent,j`，其中 `r` 是表中的盐内/溶剂内比例。`c` 是无量纲摩尔分数，仍不是 mol/L。",
         "- **浓度窗口**：在盐组成、温度和溶剂比例均相近的已观测样本中，若干较高 Bamboo 主预测标量点覆盖的扫描范围。它不是对未观测浓度的因果外推；比例以 0.05 分箱、温度以 5 °C 邻域定义“相近”。",
         "- **官能团式**：如 `-OH`、`-CF3`、`-C#N` 的连接式，仅用于结构阅读；它不是把被切分片段自动补氢后的完整分子式。",
         "- **带连接位点的片段 SMILES**：`*` 表示该片段在母体溶剂中被切开的连接位点。例如 `*OC` 是醚氧连接的甲氧基端，而不是甲醇；它用于避免把断键后的氢封端误判为羟基。",
@@ -1252,6 +1511,7 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "### 全测试集高预测优先窗口",
         "",
         "以下窗口要求每个点均达到全测试集 Bamboo 预测上四分位，同时 `dc`、`vis` 和片段总残差方向稳定。因此它们是最强的实验优先证据，而非仅有的候选体系。",
+        "“全混合物摩尔分数端点”由上式根据 0.05 分箱后的组成近似换算。例如 `LiPF6:1.00 / DEC:0.25+PC:0.75 / c=0.0612–0.1021` 对应端点约为：低端 `LiPF6:0.0612, DEC:0.2347, PC:0.7041`；高端 `LiPF6:0.1021, DEC:0.2245, PC:0.6734`。因此扫描时保持 DEC:PC=1:3，仅提高总盐摩尔分数。",
         "",
         *concentration_window_table(global_windows),
         "",
@@ -1294,7 +1554,7 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "",
         "## 化学基元与承载溶剂的物性画像",
         "",
-        "下表把高/低组常见基元与**含有该基元的溶剂**的物性画像联系起来。介电常数、黏度和熔点为反归一化后的载体溶剂描述符；最后一列是这些载体溶剂在该组中累积的 `dc / vis / Tm` 直接贡献。因而可判断一个 motif 的正/负结构贡献，是否伴随更有利的盐解离、迁移率或相态线索。它不是严格的混合物物性测量，也不能将相关性单独当作因果。",
+        "下表把高/低组常见基元与**含有该基元的溶剂**的物性画像联系起来。介电常数、黏度和熔点为反归一化后的载体溶剂描述符；`dc / vis / Tm` 是解释头的三个**有符号归一化 log 电导率项**，最后一列是三者之和。正值将解释预测上推，负值下推；因此不是“数值越小越差”，而是**负值越大（绝对值越大）才表示更强的降低方向**。这些项不是百分比，不要求合计为 1：单一配方内三项求和只得到受 `tanh` 限制的物性子项（上限 0.25），而完整解释还包含条件基准、片段主效应和片段对交互；跨 motif 行也不能相加，因为同一载体溶剂可承载多个基元。",
         "",
         *motif_property_table(high_fragments, low_fragments,
                               motif_property_rows),
@@ -1315,7 +1575,7 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "",
         "## 可视化",
         "",
-        "三张图均来自本报告上方同一批、通过最小支持度筛选的候选项。直接贡献图已按化学基元归并，第二行 `solv:` 显示前两种代表溶剂和该基元覆盖的溶剂总数；片段对图仍保留精确模型片段，以便审计交互来源。完整结构和完整溶剂清单仍以 CSV 为准。红色为正贡献/正交互，蓝色为负贡献/负交互。",
+        "前五张图均来自本报告上方同一批、通过最小支持度筛选的候选项；第六张图来自全部全局高预测窗口。直接贡献图已按化学基元归并，第二行 `solv:` 显示前两种代表溶剂和该基元覆盖的溶剂总数；片段对图仍保留精确模型片段，以便审计交互来源。完整结构和完整溶剂清单仍以 CSV 为准。贡献/交互/物性项图中红色为正方向、蓝色为负方向；物性原值图中红蓝仅表示高/低电导率组。",
         "",
         "**图 1：常见结构片段的直接贡献。** 左、右面板分别对应高、低电导率组。横轴为解释头在对应组内的平均归一化 log 电导率直接贡献，条越长说明在本数据与条件范围内模型归因越强。它回答“该片段出现时，模型倾向将解释值往上还是往下推”，不能单独证明因果。",
         "",
@@ -1328,6 +1588,18 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "**图 3：富集与直接贡献的交叉判断。** 横轴为高组出现率减低组出现率：右侧表示高组富集，左侧表示低组富集；纵轴为全样本平均直接贡献：上方为正、下方为负。图中优先标注高支持度片段，此外也强制标注同时具有明显高/低组富集和强直接贡献的低频片段（如 `-C#N (AN)`）；标签使用官能团式和代表溶剂，并以引线避开相邻点。最值得优先验证的高电导率候选通常位于右上象限，低电导率待避开候选通常位于左下象限。气泡大小随独立配方支持度增加而增大。",
         "",
         "![片段富集与直接贡献关系](fragment_enrichment_vs_direct_contribution.svg)",
+        "",
+        "**图 4：化学基元的承载溶剂物性。** 每一行对应上方表中的一个基元—承载溶剂组合；红色为高组、蓝色为低组。三列分别在各自实际单位中显示介电常数、黏度和熔点，因此用于辨别结构候选伴随的盐解离、迁移率和低温液态范围线索；不同列的横轴独立，不能直接比较数值大小。",
+        "",
+        "![化学基元承载溶剂的物性画像](motif_carrier_solvent_property_profiles.svg)",
+        "",
+        "**图 5：承载溶剂的 dc / vis / Tm 有符号物性项。** 每根条对应表内一个物性直接贡献，红色为正、蓝色为负；它们是归一化 log 电导率项而非占比。应沿同一行比较三项的方向与相对大小，而不应跨行求和。",
+        "",
+        "![化学基元承载溶剂的物性直接贡献](motif_carrier_property_terms.svg)",
+        "",
+        "**图 6：全局高预测浓度窗口。** 横线为已观测、且通过全测试集高预测与方向稳定性筛选的 `salt_molar_ratio` 覆盖范围；深色点位于范围中点，仅作视觉定位，不代表预测最优浓度。右侧数字是窗口内平均 Bamboo 主预测。",
+        "",
+        "![全局高预测浓度窗口](global_high_concentration_windows.svg)",
         "",
         "## 使用边界",
         "",
@@ -1430,7 +1702,8 @@ def main() -> None:
     }
     (output_dir / "analysis_metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
-    make_plots(output_dir, motif_rows, pair_rows, args.min_formulas)
+    make_plots(output_dir, motif_rows, pair_rows, motif_property_rows,
+               global_windows, args.min_formulas)
     (output_dir / "fragment_attribution_report_zh.md").write_text(
         make_report(samples, low_cutoff, high_cutoff, motif_rows, pair_rows,
                     property_rows, motif_property_rows, contexts,
