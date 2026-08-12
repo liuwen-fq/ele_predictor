@@ -34,6 +34,47 @@ MODIFIER_SHORTHANDS = {
 }
 
 
+PROPERTY_NORMALIZATION_PATH = (Path(__file__).resolve().parents[2] /
+                               "config/molecular_property_normalization.json")
+
+
+def load_property_normalization() -> dict[str, Any]:
+    """Load the min/max transform used by the fixed molecular checkpoint."""
+
+    if not PROPERTY_NORMALIZATION_PATH.is_file():
+        raise FileNotFoundError(
+            "missing molecular-property normalization metadata: "
+            f"{PROPERTY_NORMALIZATION_PATH}")
+    return json.loads(PROPERTY_NORMALIZATION_PATH.read_text())
+
+
+PROPERTY_NORMALIZATION = load_property_normalization()
+
+
+def physical_property_value(name: str, normalized_value: float) -> float:
+    """Invert molecular-pretraining normalization into a physical value.
+
+    This is an inversion of the property label transform, not a rigorous
+    thermodynamic mixture rule.  Mixture tables use molar-ratio-weighted
+    solvent descriptors solely to make the learned trends readable.
+    """
+
+    bounds = PROPERTY_NORMALIZATION["linear_min_max"].get(name)
+    if bounds is None:
+        return float(normalized_value)
+    value = float(bounds[0]) + float(normalized_value) * (
+        float(bounds[1]) - float(bounds[0]))
+    if name in PROPERTY_NORMALIZATION["exp_after_linear"]:
+        value = math.exp(value)
+    if name in PROPERTY_NORMALIZATION["kelvin_to_celsius"]:
+        value -= 273.15
+    return value
+
+
+def property_unit(name: str) -> str:
+    return PROPERTY_NORMALIZATION["units"].get(name, "source-label scale")
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         path.write_text("")
@@ -456,7 +497,7 @@ PROPERTY_ROLES = {
 
 
 def _weighted_property_profile(sample: dict[str, Any]) -> dict[str, float]:
-    """Return formula-level, molar-ratio-weighted frozen property values."""
+    """Return molar-ratio-weighted solvent descriptors in physical space."""
 
     record = sample["record"]
     profiles = record.get("molecular_property_profiles")
@@ -470,7 +511,7 @@ def _weighted_property_profile(sample: dict[str, Any]) -> dict[str, float]:
         ratio = float(solvent.get("molar_ratio", 0.0))
         values = solvent.get("property_values_normalized", {})
         for name, value in values.items():
-            totals[name] += ratio * float(value)
+            totals[name] += ratio * physical_property_value(name, float(value))
     return dict(totals)
 
 
@@ -509,9 +550,10 @@ def summarize_molecular_properties(samples: list[dict[str, Any]]) -> list[dict[s
             "mechanistic_role": role,
             "is_direct_explanation_term": is_direct,
             "formula_count": len(values),
-            "high_mean_value_normalized": finite_mean(high),
-            "low_mean_value_normalized": finite_mean(low),
-            "high_minus_low_value_normalized": (
+            "property_unit": property_unit(name),
+            "high_mean_value_physical": finite_mean(high),
+            "low_mean_value_physical": finite_mean(low),
+            "high_minus_low_value_physical": (
                 (finite_mean(high) or 0.0) - (finite_mean(low) or 0.0)),
             "mean_direct_effect_normalized": finite_mean(effects),
             "high_mean_direct_effect_normalized": finite_mean(high_effects),
@@ -519,7 +561,124 @@ def summarize_molecular_properties(samples: list[dict[str, Any]]) -> list[dict[s
         })
     return sorted(rows, key=lambda row: (
         not row["is_direct_explanation_term"],
-        -abs(row["high_minus_low_value_normalized"])))
+        -abs(row["high_minus_low_value_physical"])))
+
+
+def _solvent_property_lookup(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map solvent name to physical profile and direct property effects."""
+
+    profiles = record.get("molecular_property_profiles")
+    if profiles is None:
+        profiles = record.get("property_explanations", {}).get(
+            "solvent_property_contributions", [])
+    result = {}
+    for profile in profiles:
+        name = str(profile.get("molecule_name", "未知溶剂"))
+        values = {
+            key: physical_property_value(key, float(value))
+            for key, value in profile.get("property_values_normalized", {}).items()
+        }
+        result[name] = {
+            "molar_ratio": float(profile.get("molar_ratio", 0.0)),
+            "values": values,
+            "effects": {
+                key: float(value) for key, value in profile.get(
+                    "property_effects_normalized", {}).items()
+            },
+        }
+    return result
+
+
+def collect_motif_property_occurrences(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Link each motif to physical descriptors of its carrier solvent(s)."""
+
+    rows = []
+    for sample in samples:
+        record = sample["record"]
+        solvent_profiles = _solvent_property_lookup(record)
+        motifs_by_solvent: dict[str, set[str]] = defaultdict(set)
+        motif_labels: dict[str, tuple[str, str]] = {}
+        for molecule in record.get("fragment_attention", {}).get("solvents", []):
+            solvent_name = str(molecule.get("molecule_name", "未知溶剂"))
+            attached_smiles = attachment_smiles_by_fragment(molecule)
+            for fragment in molecule.get("fragments", []):
+                if "conductivity_main_effect_normalized" not in fragment:
+                    continue
+                descriptor = fragment_descriptor(attached_smiles.get(
+                    int(fragment.get("fragment_id", -1)), fragment.get("smiles", "")))
+                motif_key = descriptor["motif_key"]
+                motifs_by_solvent[solvent_name].add(motif_key)
+                motif_labels[motif_key] = (
+                    descriptor["motif_chinese_name"],
+                    descriptor["motif_group_formula"],
+                )
+        per_formula: dict[str, dict[str, Any]] = {}
+        for solvent_name, motif_keys in motifs_by_solvent.items():
+            profile = solvent_profiles.get(solvent_name)
+            if profile is None:
+                continue
+            ratio = profile["molar_ratio"]
+            for motif_key in motif_keys:
+                item = per_formula.setdefault(motif_key, {
+                    "motif_key": motif_key,
+                    "motif_chinese_name": motif_labels[motif_key][0],
+                    "motif_group_formula": motif_labels[motif_key][1],
+                    "conductivity_group": sample["conductivity_group"],
+                    "sample_index": sample["sample_index"],
+                    "carrier_solvents": set(),
+                    "ratio_sum": 0.0,
+                    "properties": defaultdict(float),
+                    "effects": defaultdict(float),
+                })
+                item["carrier_solvents"].add(solvent_name)
+                item["ratio_sum"] += ratio
+                for name, value in profile["values"].items():
+                    item["properties"][name] += ratio * value
+                # These are already molar-ratio-weighted contributions from
+                # the explanation head; do not multiply by ratio again.
+                for name, value in profile["effects"].items():
+                    item["effects"][name] += value
+        for item in per_formula.values():
+            weight = max(item.pop("ratio_sum"), 1e-12)
+            item["properties"] = {
+                name: value / weight for name, value in item["properties"].items()
+            }
+            item["effects"] = dict(item["effects"])
+            item["carrier_solvents"] = "；".join(sorted(item["carrier_solvents"]))
+            rows.append(item)
+    return rows
+
+
+def summarize_motif_property_profiles(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize carrier-solvent properties for every chemical motif."""
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[row["motif_key"]].append(row)
+    output = []
+    for motif_key, values in grouped.items():
+        high = [row for row in values if row["conductivity_group"] == "高电导率"]
+        low = [row for row in values if row["conductivity_group"] == "低电导率"]
+        row = {
+            "motif_key": motif_key,
+            "motif_chinese_name": values[0]["motif_chinese_name"],
+            "motif_group_formula": values[0]["motif_group_formula"],
+            "carrier_solvents": "；".join(sorted({
+                solvent for item in values
+                for solvent in item["carrier_solvents"].split("；") if solvent
+            })),
+            "formula_count": len(values),
+        }
+        for name in ("dc", "vis", "Tm"):
+            for group_name, group_rows in (("high", high), ("low", low)):
+                row[f"{group_name}_{name}_physical"] = finite_mean(
+                    item["properties"].get(name, float("nan"))
+                    for item in group_rows)
+                row[f"{group_name}_{name}_effect_normalized"] = finite_mean(
+                    item["effects"].get(name, float("nan"))
+                    for item in group_rows)
+        output.append(row)
+    return output
 
 
 def _ratio_bucket(value: float, width: float = 0.05) -> float:
@@ -551,9 +710,10 @@ def _direction(values: list[float], tolerance: float = 0.002) -> str:
     return "稳定正向" if positive >= len(nonzero) - positive else "稳定负向"
 
 
-def concentration_windows(samples: list[dict[str, Any]],
-                          min_points: int = 3) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Find observed high-prediction concentration windows in nearby contexts.
+def concentration_windows(samples: list[dict[str, Any]], min_points: int = 3
+                          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                     list[dict[str, Any]]]:
+    """Find global-high and context-local observed concentration windows.
 
     This is intentionally an observational recommendation, not an unmeasured
     counterfactual scan.  Contexts use solvent/salt ratio bins of 0.05 and a
@@ -584,7 +744,7 @@ def concentration_windows(samples: list[dict[str, Any]],
             "solvent_context": solvents,
             "temperature_context": temp_label,
         })
-    all_contexts, recommendations = [], []
+    all_contexts, global_recommendations, local_candidates = [], [], []
     for (salts, solvents, temp_bin), values in context_rows.items():
         by_concentration: dict[float, list[dict[str, Any]]] = defaultdict(list)
         for value in values:
@@ -600,10 +760,12 @@ def concentration_windows(samples: list[dict[str, Any]],
             })
         if len(bins) < min_points:
             continue
-        local_high = percentile([item["bamboo_prediction_ms_cm"] for item in bins], 0.75)
-        threshold = max(local_high, global_high)
+        # Use the upper 40% of each context, rather than only its top quartile:
+        # a three-point experimental window cannot exist in a six-point scan
+        # if the top quartile contains at most two points.
+        local_high = percentile([item["bamboo_prediction_ms_cm"] for item in bins], 0.60)
         high_indices = [index for index, item in enumerate(bins)
-                        if item["bamboo_prediction_ms_cm"] >= threshold]
+                        if item["bamboo_prediction_ms_cm"] >= local_high]
         all_contexts.append({
             "salt_context": salts,
             "solvent_context": solvents,
@@ -632,7 +794,7 @@ def concentration_windows(samples: list[dict[str, Any]],
             }
             if any(value == "方向不稳定" for value in directions.values()):
                 continue
-            recommendations.append({
+            item = {
                 "salt_context": salts,
                 "solvent_context": solvents,
                 "temperature_context": f"{temp_bin:.0f} °C 邻域",
@@ -656,9 +818,25 @@ def concentration_windows(samples: list[dict[str, Any]],
                 "vis_direction_stability": directions["vis_effect"],
                 "fragment_direction_stability": directions["fragment_effect"],
                 "evidence_type": "同一近邻条件上下文中的已观测浓度窗口",
-            })
+                "local_high_prediction_threshold_ms_cm": local_high,
+                "global_high_prediction_threshold_ms_cm": global_high,
+            }
+            # A strict global recommendation requires every observed point in
+            # the window to clear the test-set-wide 75th percentile.  The
+            # remaining windows are still valuable for concentration scans,
+            # but are explicitly labelled context-local rather than globally
+            # high-performing formulas.
+            if item["min_bamboo_prediction_ms_cm"] >= global_high:
+                item["recommendation_tier"] = "全局高预测优先窗口"
+                global_recommendations.append(item)
+            else:
+                item["recommendation_tier"] = "体系内局部最优扫描候选"
+                local_candidates.append(item)
     return (sorted(all_contexts, key=lambda row: -row["best_bamboo_prediction_ms_cm"]),
-            sorted(recommendations,
+            sorted(global_recommendations,
+                   key=lambda row: (-float(row["mean_bamboo_prediction_ms_cm"] or 0.0),
+                                    -row["formula_count"])),
+            sorted(local_candidates,
                    key=lambda row: (-float(row["mean_bamboo_prediction_ms_cm"] or 0.0),
                                     -row["formula_count"])))
 
@@ -734,7 +912,7 @@ def concentration_window_table(rows: list[dict[str, Any]],
     ] for row in rows[:limit]]
     return markdown_table([
         "盐组成（比例 0.05 分箱）", "温度", "溶剂组成（比例 0.05 分箱）",
-        "建议浓度区间（salt_molar_ratio）", "浓度点数", "平均 Bamboo 预测 (mS/cm)",
+        "建议扫描范围（高预测观测点 min–max；salt_molar_ratio）", "浓度点数", "平均 Bamboo 预测 (mS/cm)",
         "dc / 黏度 / 片段方向稳定性",
     ], table_rows)
 
@@ -744,15 +922,47 @@ def property_table(rows: list[dict[str, Any]], limit: int = 15) -> list[str]:
         row["property_chinese_name"] + f' (`{row["property"]}`)',
         short_text(row["mechanistic_role"], 28),
         "直接贡献项" if row["is_direct_explanation_term"] else "辅助诊断",
-        number(row["high_mean_value_normalized"], 4),
-        number(row["low_mean_value_normalized"], 4),
-        number(row["high_minus_low_value_normalized"], 4),
+        number(row["high_mean_value_physical"], 3),
+        number(row["low_mean_value_physical"], 3),
+        number(row["high_minus_low_value_physical"], 3),
+        short_text(row["property_unit"], 16),
         number(row["high_mean_direct_effect_normalized"], 4)
         if row["is_direct_explanation_term"] else "—",
     ] for row in rows[:limit]]
     return markdown_table([
         "性质", "在电导率解释中的角色", "使用方式", "高组均值", "低组均值",
-        "高−低", "高组直接贡献",
+        "高−低", "单位", "高组直接贡献（归一化 log 电导率项）",
+    ], table_rows)
+
+
+def motif_property_table(high_motifs: list[dict[str, Any]],
+                         low_motifs: list[dict[str, Any]],
+                         profiles: list[dict[str, Any]],
+                         limit_each: int = 12) -> list[str]:
+    """Show carrier-solvent property profiles beside screened motifs."""
+
+    profile_by_key = {row["motif_key"]: row for row in profiles}
+    table_rows = []
+    for group, motifs in (("高组", high_motifs[:limit_each]),
+                          ("低组", low_motifs[:limit_each])):
+        prefix = "high" if group == "高组" else "low"
+        for motif in motifs:
+            profile = profile_by_key.get(motif["motif_key"])
+            if profile is None:
+                continue
+            table_rows.append([
+                group,
+                short_text(profile["motif_chinese_name"], 24),
+                short_text(profile["carrier_solvents"], 32),
+                number(profile[f"{prefix}_dc_physical"], 2),
+                number(profile[f"{prefix}_vis_physical"], 2),
+                number(profile[f"{prefix}_Tm_physical"], 1),
+                "/".join(number(profile[f"{prefix}_{name}_effect_normalized"], 3)
+                         for name in ("dc", "vis", "Tm")),
+            ])
+    return markdown_table([
+        "电导率组", "化学基元", "承载该基元的溶剂", "介电常数 εr",
+        "黏度 (mPa·s)", "熔点 (°C)", "dc / vis / Tm 直接贡献",
     ], table_rows)
 
 
@@ -981,7 +1191,10 @@ def make_plots(output_dir: Path, fragment_rows: list[dict[str, Any]],
 def make_report(samples: list[dict[str, Any]], low_cutoff: float,
                 high_cutoff: float, motif_rows: list[dict[str, Any]],
                 pair_rows: list[dict[str, Any]], property_rows: list[dict[str, Any]],
-                contexts: list[dict[str, Any]], windows: list[dict[str, Any]],
+                motif_property_rows: list[dict[str, Any]],
+                contexts: list[dict[str, Any]],
+                global_windows: list[dict[str, Any]],
+                local_windows: list[dict[str, Any]],
                 min_formulas: int, has_all_property_profiles: bool) -> str:
     high_total = sum(s["conductivity_group"] == "高电导率" for s in samples)
     low_total = sum(s["conductivity_group"] == "低电导率" for s in samples)
@@ -989,6 +1202,14 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
                                 "high_mean_main_effect_normalized")
     low_fragments = candidates(motif_rows, "low", min_formulas,
                                "low_mean_main_effect_normalized")
+    low_negative_fragments = [
+        row for row in low_fragments
+        if float(row["low_mean_main_effect_normalized"] or 0.0) < 0.0
+    ]
+    low_context_dependent_fragments = [
+        row for row in low_fragments
+        if float(row["low_mean_main_effect_normalized"] or 0.0) >= 0.0
+    ]
     high_pairs = candidates(pair_rows, "high", min_formulas,
                             "high_mean_interaction_normalized")
     low_pairs = candidates(pair_rows, "low", min_formulas,
@@ -1003,7 +1224,8 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         f"- 高电导率组：{high_total} 个，实验电导率 ≥ {high_cutoff:.6g} mS/cm",
         f"- 候选项最小配方支持度：{min_formulas}",
         f"- 可形成浓度上下文的近邻体系数：{len(contexts)}",
-        f"- 满足高主模型预测且归因方向稳定的已观测浓度窗口数：{len(windows)}",
+        f"- 全测试集高预测且归因方向稳定的浓度窗口数：{len(global_windows)}",
+        f"- 体系内局部最优、归因方向稳定的浓度扫描候选数：{len(local_windows)}",
         "",
         "## 名词、含义与使用意义",
         "",
@@ -1012,8 +1234,10 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "- **出现率**：含某片段（或片段对）的配方数除以该高/低组总配方数。高/低出现率及其 odds ratio 用于判断片段偏向出现在哪一组。",
         "- **直接贡献（main effect）**：解释头在固定盐组成、盐浓度和温度条件下，分给一个溶剂片段的有符号归一化 log 电导率项。正值表示提高解释值，负值表示降低解释值；高/低表分别显示该组内平均值。",
         "- **协同/拮抗（interaction effect）**：来自不同溶剂分子的两个片段同时出现时的额外有符号项。正值是模型正协同候选，负值是模型负协同/拮抗候选；片段对表按对应高/低组内平均交互绝对值排序，不再优先按出现次数排序。",
-        "- **条件基准**：盐组成、浓度（源字段 `salt_molar_ratio`）和温度所给出的参考电导率。片段项描述的是相对于该基准的组成差异，不是盐效应本身。",
-        "- **浓度窗口**：在盐组成、温度和溶剂比例均相近的已观测样本中，连续的高 Bamboo 主预测浓度点。它是实验优先尝试范围，不是对未观测浓度的因果外推；比例以 0.05 分箱、温度以 5 °C 邻域定义“相近”。",
+        "- **条件基准**：盐组成、数据集盐浓度标量（源字段 `salt_molar_ratio`）和温度所给出的参考电导率。片段项描述的是相对于该基准的组成差异，不是盐效应本身。",
+        "- **盐/溶剂组成比例**：`LiTFSI:1.00` 表示 LiTFSI 占该样本**盐混合物内部**的 100%；`AN:1.00` 表示 AN 占该样本**溶剂混合物内部**的 100%。两者不构成盐:溶剂 = 1:1。",
+        "- **数据集盐浓度标量（`salt_molar_ratio`）**：这是原始配方记录中的独立输入字段。预处理代码未保存其到 mol/L 或盐/溶剂摩尔数的换算式，因此本报告只将其用作同一数据集内的相对扫描坐标，不能标为物理摩尔浓度。",
+        "- **浓度窗口**：在盐组成、温度和溶剂比例均相近的已观测样本中，若干较高 Bamboo 主预测标量点覆盖的扫描范围。它不是对未观测浓度的因果外推；比例以 0.05 分箱、温度以 5 °C 邻域定义“相近”。",
         "- **官能团式**：如 `-OH`、`-CF3`、`-C#N` 的连接式，仅用于结构阅读；它不是把被切分片段自动补氢后的完整分子式。",
         "- **带连接位点的片段 SMILES**：`*` 表示该片段在母体溶剂中被切开的连接位点。例如 `*OC` 是醚氧连接的甲氧基端，而不是甲醇；它用于避免把断键后的氢封端误判为羟基。",
         "- **精确模型片段**：带 `*` 的 SMILES 是实际输入模型的非重叠切割片段。它们保留在 `fragment_attribution_summary.csv` 中作审计；主表不再将仅切割边界不同的雷同片段重复列出。",
@@ -1022,13 +1246,24 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "",
         "## 条件化浓度窗口：实验优先尝试范围",
         "",
-        "下表从已观测配方中筛选：同一盐组成、温度邻域和相近溶剂比例下，至少有 3 个连续浓度点同时位于该上下文和全测试集的高 Bamboo 主预测区间，并且 `dc`、`vis`、片段总残差的符号在窗口内稳定。它支持如下表述：**在该盐种、温度和溶剂比例附近，优先尝试给出的浓度区间；该区间内主模型预测较高，且解释方向稳定。** 若本表为空，说明测试集中没有足够密集且可比的浓度序列，不能从现有数据给出可靠窗口。",
+        "本节不表示“只有表内两种配方值得做”。它只列出测试集恰好含有至少 3 个相邻标量点、且组成/温度相近的配方序列。多数多溶剂体系虽存在于测试集，但没有足够密的同组成浓度序列，因此不能从观察数据中宣称一个稳定窗口。",
+        "表中范围是这些较高预测观测点的最小—最大覆盖范围，不表示所有未观测的内部标量点都已验证；实验中仍需补测中间点和范围外边界点。",
         "",
-        *concentration_window_table(windows),
+        "### 全测试集高预测优先窗口",
+        "",
+        "以下窗口要求每个点均达到全测试集 Bamboo 预测上四分位，同时 `dc`、`vis` 和片段总残差方向稳定。因此它们是最强的实验优先证据，而非仅有的候选体系。",
+        "",
+        *concentration_window_table(global_windows),
+        "",
+        "### 体系内局部最优扫描候选",
+        "",
+        "以下窗口在各自盐种/温度/溶剂比例上下文中位于预测较高的 40% 区域，且归因方向稳定，但未必达到全测试集绝对高值。它们特别适合用于多组分体系的下一轮浓度扫描，而不应与上表混称为全局最优。",
+        "",
+        *concentration_window_table(local_windows, limit=20),
         "",
         "## 分子性质机制：为何该配方可能获得较高电导率",
         "",
-        "表中是按溶剂摩尔比例加权的冻结分子多任务模型输出，均为模型归一化尺度。`dc`、`vis`、`Tm` 同时是解释头的直接贡献项；其余性质只提供与极化、相态、挥发性和稳定性相关的支持线索，不能被误读为独立电导率贡献。高−低的方向适合用于提出机制假设：通常需同时观察较有利的盐解离线索（`dc`）与迁移率线索（`vis`），而不是单独优化任一性质。",
+        "表中是先按固定分子预训练的 min/max 反归一化、再按溶剂摩尔比例汇总的物理性质描述符。`dc`、`vis`、`Tm` 同时是解释头的直接贡献项；其余性质只提供与极化、相态、挥发性和稳定性相关的支持线索，不能被误读为独立电导率贡献。混合黏度与混合介电常数并非严格线性混合，本表仅用于比较模型所见的组成趋势。",
         "",
         *property_table(property_rows),
         "",
@@ -1044,10 +1279,25 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "",
         "## 低电导率常见化学基元",
         "",
-        "以下要求低组出现率至少比高组高 **2 个百分点**，且达到最小支持度。负直接贡献且低组富集的基元是更优先的待避开候选；精确 SMILES 变体见 CSV 审计附件。",
+        "以下要求低组出现率至少比高组高 **2 个百分点**，且达到最小支持度。只有**负直接贡献且低组富集**的基元，才可优先列作待避开候选；精确 SMILES 变体见 CSV 审计附件。",
         "",
-        *fragment_table(low_fragments, 20, "low_mean_main_effect_normalized",
+        *fragment_table(low_negative_fragments, 20, "low_mean_main_effect_normalized",
                         "低组内平均直接贡献"),
+        "",
+        "### 低组富集、但直接贡献为正或接近零的基元",
+        "",
+        "这些基元常出现在低电导率配方中，但在控制盐种、数据集盐浓度标量、温度和其他结构条件后，解释头仍给出正向或接近零的局部直接贡献。因此**不能**据此断言“该基元会降低电导率”，也不应直接加入待避开清单；它更可能与高黏度、低迁移率、盐浓度、其他溶剂或片段交互等共同条件相关。",
+        "",
+        *fragment_table(low_context_dependent_fragments, 20,
+                        "low_mean_main_effect_normalized",
+                        "低组内平均直接贡献"),
+        "",
+        "## 化学基元与承载溶剂的物性画像",
+        "",
+        "下表把高/低组常见基元与**含有该基元的溶剂**的物性画像联系起来。介电常数、黏度和熔点为反归一化后的载体溶剂描述符；最后一列是这些载体溶剂在该组中累积的 `dc / vis / Tm` 直接贡献。因而可判断一个 motif 的正/负结构贡献，是否伴随更有利的盐解离、迁移率或相态线索。它不是严格的混合物物性测量，也不能将相关性单独当作因果。",
+        "",
+        *motif_property_table(high_fragments, low_fragments,
+                              motif_property_rows),
         "",
         "## 高电导率组中的片段对协同与拮抗",
         "",
@@ -1084,7 +1334,7 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "- 本报告的直接贡献和交互贡献严格加和到解释头的片段残差；它们不修改 Bamboo 最终预测。",
         "- 片段及片段对的正负号是模型在给定条件下学到的关联，不等同于化学实验中的单因素因果效应。",
         "- 设计候选应优先选择：高支持度、在不同配方中方向一致、同时具有高组富集和正贡献（或低组富集和负贡献）的项。",
-        "- 浓度窗口的第一轮实验应优先在窗口内部取低/中/高三个点，并在边界外各补一个点，以验证是否存在真实平台而非数据偶然聚集。",
+        "- 浓度窗口的第一轮实验应优先在窗口内部取低/中/高三个点，并在边界外各补一个点，以验证是否存在真实平台而非数据偶然聚集；如原始数据可以提供 `salt_molar_ratio` 到 mol/L 的换算，请在实验计划中先完成该换算。",
         "- 建议在盐种、浓度、温度和摩尔比例尽量可比时，使用真实溶剂替换或补充实验进行验证。",
     ]
     return "\n".join(lines) + "\n"
@@ -1119,20 +1369,38 @@ def main() -> None:
     pair_rows = summarize_pairs(
         collect_pair_occurrences(samples), high_total, low_total)
     property_rows = summarize_molecular_properties(samples)
-    contexts, windows = concentration_windows(samples)
+    motif_property_rows = summarize_motif_property_profiles(
+        collect_motif_property_occurrences(samples))
+    contexts, global_windows, local_windows = concentration_windows(samples)
     has_all_property_profiles = any(
         "molecular_property_profiles" in sample["record"] for sample in samples)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    high_motif_candidates = candidates(
+        motif_rows, "high", args.min_formulas,
+        "high_mean_main_effect_normalized")
+    low_motif_candidates = candidates(
+        motif_rows, "low", args.min_formulas,
+        "low_mean_main_effect_normalized")
+    low_negative_motif_candidates = [
+        row for row in low_motif_candidates
+        if float(row["low_mean_main_effect_normalized"] or 0.0) < 0.0
+    ]
+    low_context_dependent_motif_candidates = [
+        row for row in low_motif_candidates
+        if float(row["low_mean_main_effect_normalized"] or 0.0) >= 0.0
+    ]
     write_csv(output_dir / "fragment_attribution_summary.csv", fragment_rows)
     write_csv(output_dir / "chemical_motif_attribution_summary.csv", motif_rows)
     write_csv(output_dir / "high_conductivity_common_fragments.csv",
-              candidates(motif_rows, "high", args.min_formulas,
-                         "high_mean_main_effect_normalized"))
+              high_motif_candidates)
     write_csv(output_dir / "low_conductivity_common_fragments.csv",
-              candidates(motif_rows, "low", args.min_formulas,
-                         "low_mean_main_effect_normalized"))
+              low_motif_candidates)
+    write_csv(output_dir / "low_conductivity_negative_contribution_motifs.csv",
+              low_negative_motif_candidates)
+    write_csv(output_dir / "low_conductivity_context_dependent_motifs.csv",
+              low_context_dependent_motif_candidates)
     write_csv(output_dir / "fragment_pair_interaction_summary.csv", pair_rows)
     write_csv(output_dir / "high_conductivity_fragment_pairs.csv",
               candidates(pair_rows, "high", args.min_formulas,
@@ -1142,8 +1410,13 @@ def main() -> None:
                          "low_mean_interaction_normalized"))
     write_csv(output_dir / "molecular_property_mechanism_summary.csv",
               property_rows)
+    write_csv(output_dir / "motif_carrier_solvent_property_profiles.csv",
+              motif_property_rows)
     write_csv(output_dir / "concentration_context_summary.csv", contexts)
-    write_csv(output_dir / "recommended_concentration_windows.csv", windows)
+    write_csv(output_dir / "recommended_concentration_windows.csv",
+              global_windows)
+    write_csv(output_dir / "local_concentration_scan_candidates.csv",
+              local_windows)
     metadata = {
         "input": str(args.input), "experimental_formula_count": len(samples),
         "quantile": args.quantile, "low_cutoff_ms_cm": low_cutoff,
@@ -1151,7 +1424,8 @@ def main() -> None:
         "high_formula_count": high_total, "low_formula_count": low_total,
         "motif_count": len(motif_rows),
         "concentration_context_count": len(contexts),
-        "recommended_concentration_window_count": len(windows),
+        "recommended_concentration_window_count": len(global_windows),
+        "local_concentration_scan_candidate_count": len(local_windows),
         "has_all_molecular_property_profiles": has_all_property_profiles,
     }
     (output_dir / "analysis_metadata.json").write_text(
@@ -1159,7 +1433,8 @@ def main() -> None:
     make_plots(output_dir, motif_rows, pair_rows, args.min_formulas)
     (output_dir / "fragment_attribution_report_zh.md").write_text(
         make_report(samples, low_cutoff, high_cutoff, motif_rows, pair_rows,
-                    property_rows, contexts, windows, args.min_formulas,
+                    property_rows, motif_property_rows, contexts,
+                    global_windows, local_windows, args.min_formulas,
                     has_all_property_profiles))
     print(f"Wrote comprehensive fragment attribution analysis to: {output_dir}")
 
