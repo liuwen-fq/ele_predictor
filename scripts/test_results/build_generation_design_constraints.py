@@ -204,22 +204,45 @@ def plot_motifs(rows, output):
 
 def plot_properties(rows, output):
     rows = [r for r in rows if r["property"] in DIRECT_PROPERTIES]
-    fig, ax = plt.subplots(figsize=(10, 4.8))
-    y = np.arange(len(rows))
-    for index, row in enumerate(rows):
-        lo, hi = float(row["recommended_low"]), float(row["recommended_high"])
+    # Each property has a different physical scale and unit.  Separate panels
+    # prevent viscosity's unit from being pushed into the title/border and
+    # make the numerical range readable instead of implying cross-property
+    # distances are comparable.
+    order = {name: index for index, name in enumerate(DIRECT_PROPERTIES)}
+    rows = sorted(rows, key=lambda row: order[row["property"]])
+    fig, axes = plt.subplots(1, len(rows), figsize=(16, 5.2), squeeze=False)
+    axes = axes[0]
+    for ax, row in zip(axes, rows):
+        lo = float(row["recommended_low"])
+        hi = float(row["recommended_high"])
         medians = [float(row[f"{s}_median"]) for s in SPLITS
                    if row.get(f"{s}_median", "") not in ("", None)]
-        med = np.mean(medians)
-        ax.hlines(index, lo, hi, color="#4c72b0", linewidth=8, alpha=.7)
-        ax.plot(med, index, "o", color="#c44e52", markersize=7)
-        ax.text(hi, index + .16, row["property_unit"], fontsize=8,
-                ha="right", va="bottom")
-    ax.set_yticks(y, [r["property"] for r in rows])
-    ax.set_xlabel("Physical-property value (each row has its own unit/scale)")
-    ax.set_title("High-conductivity molecular-property soft windows")
-    ax.grid(axis="x", alpha=.25)
-    fig.tight_layout()
+        med = float(np.mean(medians))
+        span = max(hi - lo, 1e-6)
+        padding = .16 * span
+        ax.hlines(0, lo, hi, color="#4c72b0", linewidth=12, alpha=.72,
+                  label="P10–P90 soft range")
+        ax.plot(med, 0, "o", color="#c44e52", markersize=8,
+                label="mean split median", zorder=3)
+        ax.text(lo, .18, f"low\n{lo:.4g}", ha="left", va="bottom",
+                fontsize=8, color="#24476b")
+        ax.text(med, -.18, f"median\n{med:.4g}", ha="center", va="top",
+                fontsize=8, color="#9e3034")
+        ax.text(hi, .18, f"high\n{hi:.4g}", ha="right", va="bottom",
+                fontsize=8, color="#24476b")
+        ax.set_xlim(lo - padding, hi + padding)
+        ax.set_ylim(-.42, .42)
+        ax.set_yticks([])
+        ax.set_title(row["property"], pad=12)
+        ax.set_xlabel(row["property_unit"], labelpad=8)
+        ax.grid(axis="x", alpha=.25)
+        for spine in ("left", "right", "top"):
+            ax.spines[spine].set_visible(False)
+    fig.suptitle("High-conductivity molecular-property soft windows", y=.98,
+                 fontsize=14)
+    fig.text(.5, .01, "蓝色：P10–P90 推荐软范围；红点：train/valid split 中位数的平均值",
+             ha="center", fontsize=9)
+    fig.tight_layout(rect=[0, .06, 1, .91], w_pad=2.8)
     fig.savefig(output, format="svg", bbox_inches="tight")
     plt.close(fig)
 
