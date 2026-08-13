@@ -244,19 +244,19 @@ def plot_response(rows: list[dict], summary: list[dict], output: Path):
     for row in rows:
         by_candidate[row["candidate_id"]].append(row)
     summary_by_id = {row["candidate_id"]: row for row in summary}
-    columns, panel_w, panel_h = 3, 560, 300
+    columns, panel_w, panel_h = 3, 560, 340
     height = math.ceil(len(summary) / columns) * panel_h + 65
     elements = [svg_text(columns * panel_w / 2, 22,
                          "25–60 °C controlled temperature–concentration model scan",
                          16, "middle", "bold"),
                 svg_text(15, 43,
-                         "colours: temperature; shaded band: robust concentration window; all curves are model predictions",
+                         "line colour legend: 25 °C  30 °C  35 °C  40 °C  45 °C  50 °C  55 °C  60 °C; shaded band: robust concentration window",
                          10)]
     palette = {25: "#2166ac", 30: "#4393c3", 35: "#92c5de", 40: "#f4a582",
                45: "#d6604d", 50: "#b2182b", 55: "#762a83", 60: "#4d004b"}
     for index, item in enumerate(summary):
         x0, y0 = 12 + index % columns * panel_w, 58 + index // columns * panel_h
-        left, right, top, bottom = x0 + 52, x0 + panel_w - 18, y0 + 58, y0 + panel_h - 38
+        left, right, top, bottom = x0 + 52, x0 + panel_w - 18, y0 + 96, y0 + panel_h - 38
         points = by_candidate[item["candidate_id"]]
         y_values = [point["conductivity_pred_ms_cm"] for point in points]
         y_min, y_max = max(0.0, min(y_values) - 0.5), max(y_values) + 0.5
@@ -269,6 +269,21 @@ def plot_response(rows: list[dict], summary: list[dict], output: Path):
                               f'{item["candidate_id"]}: {item["salt_context"]} | {item["solvent_context"]}', 10, "middle", "bold"),
                      svg_text(x0 + (panel_w - 8) / 2, y0 + 32,
                               f'worst={item["worst_case_pred_ms_cm"]:.2f}; c={item["recommended_c_low"]:.2f}–{item["recommended_c_high"]:.2f}', 9, "middle")]
+        # A compact per-panel legend doubles as a peak table.  This is more
+        # readable than placing eight labels directly beside potentially
+        # overlapping maxima on the curves.
+        for temp_index, temp in enumerate(range(25, 61, 5)):
+            curve = [point for point in points if point["temperature_c"] == temp]
+            peak = max(curve, key=lambda point: point["conductivity_pred_ms_cm"])
+            col, legend_row = temp_index % 4, temp_index // 4
+            legend_x = x0 + 15 + col * 134
+            legend_y = y0 + 48 + legend_row * 15
+            elements.append(f'<rect x="{legend_x:.1f}" y="{legend_y - 8:.1f}" '
+                            f'width="8" height="8" fill="{palette[temp]}"/>')
+            elements.append(svg_text(
+                legend_x + 12, legend_y,
+                f'{temp}°: {peak["conductivity_pred_ms_cm"]:.1f}@{peak["salt_molar_ratio"]:.2f}',
+                8))
         elements.append(f'<rect x="{px(item["recommended_c_low"]):.1f}" y="{top:.1f}" width="{px(item["recommended_c_high"]) - px(item["recommended_c_low"]):.1f}" height="{bottom-top:.1f}" fill="#f6caca" fill-opacity="0.5"/>')
         for temp in range(25, 61, 5):
             curve = sorted((point for point in points if point["temperature_c"] == temp), key=lambda point: point["salt_molar_ratio"])
@@ -283,6 +298,55 @@ def plot_response(rows: list[dict], summary: list[dict], output: Path):
 
 def markdown_table(headers, rows):
     return ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |", *["| " + " | ".join(row) + " |" for row in rows]]
+
+
+def component_text(components: list[dict]) -> str:
+    return "+".join(
+        f'{item["name"]}:{float(item["molar_ratio"]):.2f}'
+        for item in sorted(components, key=lambda item: item["name"]))
+
+
+def conductivity_ms_cm(normalized: float) -> float:
+    return math.exp(float(normalized) * LOG_SCALE + LOG_OFFSET)
+
+
+def high_conductivity_evidence() -> tuple[list[dict], dict[str, float]]:
+    """Collect labelled high-conductivity records from training and validation.
+
+    They are experimental labels but are training/selection evidence, not an
+    independent test-set performance measure.
+    """
+
+    rows, thresholds = [], {}
+    for split in ("ft_train", "ft_valid"):
+        source = Path("run/data") / split / "processed_data.json"
+        records = json.loads(source.read_text())
+        labelled = [record for record in records if bool(record.get("conductivity_mask"))]
+        values = [conductivity_ms_cm(record["conductivity"]) for record in labelled]
+        threshold = percentile(values, 0.75)
+        thresholds[split] = threshold
+        for record, value in zip(labelled, values):
+            if value < threshold:
+                continue
+            rows.append({
+                "split": split,
+                "experimental_conductivity_ms_cm": value,
+                "temperature_c": physical_temperature(float(record["temperature"])),
+                "salt_molar_ratio": float(record["salt_molar_ratio"]),
+                "salts": component_text(record["salts"]),
+                "solvents": component_text(record["solvents"]),
+            })
+    return sorted(rows, key=lambda row: -row["experimental_conductivity_ms_cm"]), thresholds
+
+
+def write_high_evidence(output: Path) -> tuple[list[dict], dict[str, float]]:
+    rows, thresholds = high_conductivity_evidence()
+    fields = ["split", "experimental_conductivity_ms_cm", "temperature_c",
+              "salt_molar_ratio", "salts", "solvents"]
+    with open(output, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader(); writer.writerows(rows)
+    return rows, thresholds
 
 
 def write_report(path: Path, summary: list[dict], rows: list[dict]):
@@ -306,7 +370,8 @@ def write_report(path: Path, summary: list[dict], rows: list[dict]):
     path.write_text("\n".join(lines))
 
 
-def update_main_report(path: Path, summary: list[dict]):
+def update_main_report(path: Path, summary: list[dict], high_evidence: list[dict],
+                       thresholds: dict[str, float]):
     """Append a reproducible robustness-screening section to the main report."""
     text = path.read_text()
     marker = "## 温度—浓度鲁棒性筛选（25–60 °C 模型扫描）"
@@ -324,6 +389,15 @@ def update_main_report(path: Path, summary: list[dict]):
                 *markdown_table(["候选", "盐", "溶剂比例", "推荐 c", "温区平均预测", "温区最差预测", "温度跨度", "dc / vis / Tm / 片段方向"], table),
                 "", "**解释性读取。** `dc / vis / Tm / 片段方向` 分别是在推荐温度—浓度窗口内的解释头方向稳定性。优先候选应同时具有较高的温区最差预测、较宽的浓度窗口和稳定的解释方向；其中 `vis` 不稳定的体系（例如 LiTFSI/PC、LiBOB/PC）不宜作为首选稳健候选。LiTFSI/AN 在本扫描中具有最高温区平均与最差预测，且四类解释项均稳定正向；LiTFSI/Glyme 的 `dc` 为稳定负向，说明其高预测更依赖迁移率/片段残差等其他条件贡献，不能简单归因于介电常数。", "",
                 "![25–60 °C 温度—浓度鲁棒性扫描](temperature_concentration_robustness/temperature_concentration_robustness_scan.svg)", "",
+                "图中每个彩色方块给出该温度曲线的 `温度: 最高预测电导率@对应 c`，因此可直接读取每个温度的预测峰值；这些峰值用于比较，不等同于推荐的鲁棒区间。", "",
+                "## 训练集与验证集：高电导率实验配方证据", "",
+                f"下表来自带实验电导率标签的 FT 训练集和验证集，分别取各自实验电导率最高 25%（阈值：训练集 ≥ {thresholds['ft_train']:.2f} mS/cm；验证集 ≥ {thresholds['ft_valid']:.2f} mS/cm），按实测值列出前 15 条。它们可用于判断候选是否有历史实验邻域支持，但**训练集条目不能用来报告模型泛化性能**。完整清单见 `temperature_concentration_robustness/train_valid_high_conductivity_formulas.csv`。", "",
+                *markdown_table(["来源", "实验电导率", "温度", "c", "盐", "溶剂内比例"], [[
+                    "训练集" if row["split"] == "ft_train" else "验证集",
+                    f'{row["experimental_conductivity_ms_cm"]:.2f}',
+                    f'{row["temperature_c"]:.1f} °C',
+                    f'{row["salt_molar_ratio"]:.4f}', row["salts"], row["solvents"]]
+                    for row in high_evidence[:15]]), "",
                 "完整逐网格预测、候选排序及单独方法报告见 `temperature_concentration_robustness/`。", ""]
     path.write_text(text + "\n".join(addition))
 
@@ -352,7 +426,9 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=summary[0].keys()); writer.writeheader(); writer.writerows(summary)
     plot_response(rows, summary, output / "temperature_concentration_robustness_scan.svg")
     write_report(output / "temperature_concentration_robustness_report_zh.md", summary, rows)
-    update_main_report(Path(args.main_report), summary)
+    high_evidence, thresholds = write_high_evidence(
+        output / "train_valid_high_conductivity_formulas.csv")
+    update_main_report(Path(args.main_report), summary, high_evidence, thresholds)
     print(f"Wrote {len(rows)} model scan points for {len(candidates)} candidates to {output}")
 
 
