@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash submit/run_property_fragment_explanation_pipeline.sh [all|train|predict|explain]
+# Usage: bash submit/run_property_fragment_explanation_pipeline.sh [all|train|predict|explain|design]
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -9,8 +9,8 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 
 MODE="${1:-all}"
-[[ "$MODE" =~ ^(all|train|predict|explain)$ ]] || {
-    echo "Usage: bash submit/run_property_fragment_explanation_pipeline.sh [all|train|predict|explain]" >&2
+[[ "$MODE" =~ ^(all|train|predict|explain|design)$ ]] || {
+    echo "Usage: bash submit/run_property_fragment_explanation_pipeline.sh [all|train|predict|explain|design]" >&2
     exit 2
 }
 
@@ -68,6 +68,9 @@ if [[ "$MODE" == all || "$MODE" == explain ]]; then
         --input "$RESULT" --output-dir "$ARTIFACT_DIR/properties"
     python3 -u scripts/test_results/analyze_conductivity_fragment_attributions.py \
         --input "$RESULT" --output-dir "$ATTRIBUTION_DIR"
+fi
+if [[ "$MODE" == design ]]; then
+    bash submit/run_generation_design_constraints.sh
 fi
 
 echo "Finished property-fragment explanation pipeline: $RUN_DIR"
