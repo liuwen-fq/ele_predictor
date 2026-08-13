@@ -349,7 +349,65 @@ def write_high_evidence(output: Path) -> tuple[list[dict], dict[str, float]]:
     return rows, thresholds
 
 
-def write_report(path: Path, summary: list[dict], rows: list[dict]):
+def plot_high_evidence(rows: list[dict], output: Path, limit_each: int = 10):
+    """Plot the best labelled experimental formulas separately by split."""
+
+    width, panel_width, label_width, row_height = 1850, 900, 460, 42
+    subsets = {
+        split: [row for row in rows if row["split"] == split][:limit_each]
+        for split in ("ft_train", "ft_valid")
+    }
+    height = max(260, 110 + max(len(items) for items in subsets.values()) * row_height)
+    elements = [svg_text(width / 2, 23,
+                         "High-conductivity experimental formulation evidence",
+                         16, "middle", "bold"),
+                svg_text(15, 43,
+                         "Bars show measured conductivity (mS/cm), not model predictions. Train and validation are shown separately.",
+                         10)]
+    panel_specs = (("ft_train", "Training-set evidence", "#5a8f6d", 15),
+                   ("ft_valid", "Validation-set evidence", "#517da5", 930))
+    for split, title, color, x0 in panel_specs:
+        selected = subsets[split]
+        panel_right = x0 + panel_width - 15
+        plot_left, plot_right = x0 + label_width, panel_right - 15
+        max_value = max((row["experimental_conductivity_ms_cm"] for row in selected),
+                        default=1.0) * 1.12
+        elements += [f'<rect x="{x0}" y="{58}" width="{panel_width - 10}" '
+                     f'height="{height - 68}" fill="white" stroke="#bbbbbb"/>',
+                     svg_text(x0 + panel_width / 2, 76, title, 13, "middle", "bold"),
+                     svg_text(plot_left, 93, "0", 8),
+                     svg_text(plot_right, 93, f"{max_value:.1f}", 8, "end")]
+        for index, row in enumerate(selected):
+            y = 118 + index * row_height
+            value = row["experimental_conductivity_ms_cm"]
+            bar_width = value / max_value * (plot_right - plot_left)
+            label = (f'{row["salts"]} / {row["solvents"]}; '
+                     f'{row["temperature_c"]:.1f}°C, c={row["salt_molar_ratio"]:.3f}')
+            elements.append(svg_text(plot_left - 9, y + 10, label, 9, "end"))
+            elements.append(f'<rect x="{plot_left:.1f}" y="{y:.1f}" '
+                            f'width="{bar_width:.1f}" height="16" fill="{color}"/>')
+            elements.append(svg_text(plot_left + bar_width + 4, y + 12,
+                                     f"{value:.2f}", 9))
+    write_svg(output, width, height, elements)
+
+
+def evidence_table_rows(rows: list[dict], limit_each: int = 8) -> list[list[str]]:
+    """Keep both splits visible rather than letting train extremes dominate."""
+
+    output = []
+    for split in ("ft_train", "ft_valid"):
+        for row in [item for item in rows if item["split"] == split][:limit_each]:
+            output.append([
+                "训练集" if split == "ft_train" else "验证集",
+                f'{row["experimental_conductivity_ms_cm"]:.2f}',
+                f'{row["temperature_c"]:.1f} °C',
+                f'{row["salt_molar_ratio"]:.4f}', row["salts"], row["solvents"],
+            ])
+    return output
+
+
+def write_report(path: Path, summary: list[dict], rows: list[dict],
+                 high_evidence: list[dict], thresholds: dict[str, float]):
     table = [[item["candidate_id"], item["salt_context"], item["solvent_context"],
               f'{item["recommended_c_low"]:.2f}–{item["recommended_c_high"]:.2f}',
               f'{item["mean_pred_ms_cm"]:.2f}', f'{item["worst_case_pred_ms_cm"]:.2f}',
@@ -367,6 +425,11 @@ def write_report(path: Path, summary: list[dict], rows: list[dict]):
              "", "## 图：温度—浓度响应", "",
              "每个面板固定一个候选组成；横轴为盐摩尔分数，纵轴为 Bamboo 主预测电导率（mS/cm）。不同颜色对应温度；浅红色为推荐鲁棒浓度区间。", "",
              "![温度—浓度鲁棒性扫描](temperature_concentration_robustness_scan.svg)", ""]
+    lines += ["## 训练集与验证集高电导率实验配方", "",
+              f"分别取训练集和验证集中带实验标签记录的最高 25%（训练集阈值 ≥ {thresholds['ft_train']:.2f} mS/cm；验证集阈值 ≥ {thresholds['ft_valid']:.2f} mS/cm）。图和表仅作历史实验支持；训练集不能用于泛化性能声明。", "",
+              "![训练集与验证集高电导率实验配方](train_valid_high_conductivity_evidence.svg)", "",
+              *markdown_table(["来源", "实验电导率", "温度", "c", "盐", "溶剂内比例"],
+                              evidence_table_rows(high_evidence)), ""]
     path.write_text("\n".join(lines))
 
 
@@ -391,13 +454,10 @@ def update_main_report(path: Path, summary: list[dict], high_evidence: list[dict
                 "![25–60 °C 温度—浓度鲁棒性扫描](temperature_concentration_robustness/temperature_concentration_robustness_scan.svg)", "",
                 "图中每个彩色方块给出该温度曲线的 `温度: 最高预测电导率@对应 c`，因此可直接读取每个温度的预测峰值；这些峰值用于比较，不等同于推荐的鲁棒区间。", "",
                 "## 训练集与验证集：高电导率实验配方证据", "",
-                f"下表来自带实验电导率标签的 FT 训练集和验证集，分别取各自实验电导率最高 25%（阈值：训练集 ≥ {thresholds['ft_train']:.2f} mS/cm；验证集 ≥ {thresholds['ft_valid']:.2f} mS/cm），按实测值列出前 15 条。它们可用于判断候选是否有历史实验邻域支持，但**训练集条目不能用来报告模型泛化性能**。完整清单见 `temperature_concentration_robustness/train_valid_high_conductivity_formulas.csv`。", "",
-                *markdown_table(["来源", "实验电导率", "温度", "c", "盐", "溶剂内比例"], [[
-                    "训练集" if row["split"] == "ft_train" else "验证集",
-                    f'{row["experimental_conductivity_ms_cm"]:.2f}',
-                    f'{row["temperature_c"]:.1f} °C',
-                    f'{row["salt_molar_ratio"]:.4f}', row["salts"], row["solvents"]]
-                    for row in high_evidence[:15]]), "",
+                f"训练集和验证集分别取带实验电导率标签记录的最高 25%（阈值：训练集 ≥ {thresholds['ft_train']:.2f} mS/cm；验证集 ≥ {thresholds['ft_valid']:.2f} mS/cm）。两者分开呈现，避免训练集极值掩盖验证集证据。它们可用于判断候选是否有历史实验邻域支持，但**训练集条目不能用来报告模型泛化性能**。完整清单见 `temperature_concentration_robustness/train_valid_high_conductivity_formulas.csv`。", "",
+                "![训练集与验证集高电导率实验配方](temperature_concentration_robustness/train_valid_high_conductivity_evidence.svg)", "",
+                *markdown_table(["来源", "实验电导率", "温度", "c", "盐", "溶剂内比例"],
+                                evidence_table_rows(high_evidence)), "",
                 "完整逐网格预测、候选排序及单独方法报告见 `temperature_concentration_robustness/`。", ""]
     path.write_text(text + "\n".join(addition))
 
@@ -425,9 +485,12 @@ def main():
     with open(output / "robustness_ranking.csv", "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=summary[0].keys()); writer.writeheader(); writer.writerows(summary)
     plot_response(rows, summary, output / "temperature_concentration_robustness_scan.svg")
-    write_report(output / "temperature_concentration_robustness_report_zh.md", summary, rows)
     high_evidence, thresholds = write_high_evidence(
         output / "train_valid_high_conductivity_formulas.csv")
+    plot_high_evidence(high_evidence,
+                       output / "train_valid_high_conductivity_evidence.svg")
+    write_report(output / "temperature_concentration_robustness_report_zh.md",
+                 summary, rows, high_evidence, thresholds)
     update_main_report(Path(args.main_report), summary, high_evidence, thresholds)
     print(f"Wrote {len(rows)} model scan points for {len(candidates)} candidates to {output}")
 
