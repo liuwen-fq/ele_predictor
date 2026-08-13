@@ -353,6 +353,15 @@ def main():
 
     parser = argparse.ArgumentParser(description='test local')
     parser.add_argument('--conf', type=str, default='test_config.yaml')
+    parser.add_argument('--save-dir', type=str,
+                        help='override processed dataset directory')
+    parser.add_argument('--output-path', type=str,
+                        help='override prediction JSON output path')
+    parser.add_argument(
+        '--labelled-only',
+        action='store_true',
+        help=('run only records with experimental conductivity labels; this '
+              'uses existing processed graphs and does not preprocess data'))
     args = parser.parse_args()
 
     assert os.path.exists(args.conf) and args.conf.endswith(
@@ -360,6 +369,11 @@ def main():
 
     with open(args.conf, 'r') as f:
         test_conf = yaml.safe_load(f)
+
+    if args.save_dir:
+        test_conf["save_dir"] = args.save_dir
+    if args.output_path:
+        test_conf["output_path"] = args.output_path
 
     output_path = test_conf.pop("output_path")
     ckpt_path = test_conf.pop("ckpt_path")
@@ -372,7 +386,27 @@ def main():
     model.to("cuda")
     model.eval()
 
+    with open(os.path.join(test_conf["save_dir"], "processed_data.json"),
+              "r") as file:
+        test_data = json.load(file)
+
     dataset = MXDataset(test_conf)
+    if args.labelled_only:
+        labelled_indices = [
+            index for index, entry in enumerate(test_data)
+            if bool(entry.get("conductivity_mask"))
+        ]
+        if not labelled_indices:
+            raise ValueError("--labelled-only found no experimental labels")
+        if len(dataset) != len(test_data):
+            raise ValueError(
+                "processed graph and metadata counts differ: "
+                f"{len(dataset)} != {len(test_data)}")
+        dataset.data_list = [dataset.data_list[index]
+                             for index in labelled_indices]
+        test_data = [test_data[index] for index in labelled_indices]
+        logger.info("Restricted prediction to %d labelled formulas",
+                    len(test_data))
     valid_dl = DataLoader(dataset,
                           batch_size=256,
                           shuffle=False,
@@ -551,10 +585,6 @@ def main():
                 viss.append(vis)
 
         logger.info(f"Finishing prediction of batch {batch_idx}")
-
-    with open(os.path.join(test_conf["save_dir"], "processed_data.json"),
-              "r") as file:
-        test_data = json.load(file)
 
     for i, entry in enumerate(test_data):
         entry["temperature"] = entry["temperature"] * 373.15 - 273.15
