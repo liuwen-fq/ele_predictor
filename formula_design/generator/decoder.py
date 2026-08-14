@@ -217,6 +217,23 @@ class FormulaDecoder(nn.Module):
         self.salt_sab = SetTransformerBlock(num_heads=4,
                                             emb_dim=formula_emb_dim // 3,
                                             **set_transformer_block)
+        # Candidate-pool experiments may use a molecular encoder whose output
+        # dimension differs from the *candidate-slot* dimension.  The
+        # dictionary is compared with ``solv_mol_emb`` / ``salt_mol_emb``
+        # below, whose dimension is the SetTransformer hidden dimension (not
+        # the 384-dimensional formula embedding or its 2:1 split).
+        #
+        # Identity therefore preserves Bamboo's historical 64-dictionary
+        # path, while the learned projections make a new molecular vocabulary
+        # usable without a silent ``torch.cdist`` shape mismatch.
+        solv_dim = int(set_transformer_block["hidden_dim"])
+        salt_dim = int(set_transformer_block["hidden_dim"])
+        self.solv_dict_projection = (
+            torch.nn.Identity() if self.solv_dict.size(-1) == solv_dim else
+            torch.nn.Linear(self.solv_dict.size(-1), solv_dim, bias=False))
+        self.salt_dict_projection = (
+            torch.nn.Identity() if self.salt_dict.size(-1) == salt_dim else
+            torch.nn.Linear(self.salt_dict.size(-1), salt_dim, bias=False))
 
     def load_ckpt(self, ckpt_path):
         self.load_state_dict(torch.load(ckpt_path)['model_state_dict'])
@@ -240,10 +257,10 @@ class FormulaDecoder(nn.Module):
         salt_mol_emb, salt_molar_ratios = self.salt_sab(salt_emb)
         norm_salt_mol_emb = F.normalize(salt_mol_emb, dim=-1, p=2)
 
-        solv_dict = F.normalize(self.solv_dict, dim=-1,
+        solv_dict = F.normalize(self.solv_dict_projection(self.solv_dict), dim=-1,
                                 p=2).to(device).unsqueeze(0).expand(
                                     solv_mol_emb.size()[0], -1, -1)
-        salt_dict = F.normalize(self.salt_dict, dim=-1,
+        salt_dict = F.normalize(self.salt_dict_projection(self.salt_dict), dim=-1,
                                 p=2).to(device).unsqueeze(0).expand(
                                     salt_mol_emb.size()[0], -1, -1)
 
@@ -292,10 +309,10 @@ class FormulaDecoder(nn.Module):
         salt_mol_emb, salt_molar_ratios = self.salt_sab(salt_emb)
         norm_salt_mol_emb = F.normalize(salt_mol_emb, dim=-1, p=2)
 
-        solv_dict = F.normalize(self.solv_dict, dim=-1,
+        solv_dict = F.normalize(self.solv_dict_projection(self.solv_dict), dim=-1,
                                 p=2).to(device).unsqueeze(0).expand(
                                     solv_mol_emb.size()[0], -1, -1)
-        salt_dict = F.normalize(self.salt_dict, dim=-1,
+        salt_dict = F.normalize(self.salt_dict_projection(self.salt_dict), dim=-1,
                                 p=2).to(device).unsqueeze(0).expand(
                                     salt_mol_emb.size()[0], -1, -1)
 

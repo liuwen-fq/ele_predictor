@@ -19,6 +19,7 @@ import math
 import os
 import random
 import textwrap
+import zipfile
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from enum import IntEnum
@@ -137,13 +138,21 @@ class TrainConfig:
 
     def get_latest_ckpt(self) -> str:
         paths = glob(os.path.join(self.ckpt_folder, "ckpt_epoch_*.pt"))
-        if not paths:
-            return None
-        else:
-            epochs = [int(fp.split('_')[-1].split('.')[0]) for fp in paths]
-            path = os.path.join(self.ckpt_folder,
-                                f"ckpt_epoch_{max(epochs)}.pt")
+        def epoch_number(path):
+            return int(os.path.basename(path).split('_')[-1].split('.')[0])
+
+        # A full filesystem can leave a truncated torch checkpoint behind.
+        # Prefer the newest archive whose central directory can be read, so a
+        # single failed save does not make --restart unusable.
+        for path in sorted(paths, key=epoch_number, reverse=True):
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    archive.infolist()
+            except (OSError, zipfile.BadZipFile):
+                print(f"Skipping unreadable checkpoint during restart: {path}")
+                continue
             return path
+        return None
 
     @property
     def finish_flag(self):
@@ -776,11 +785,27 @@ class FormulaTrainer(BaseTrainer):
 
     def _init_model(self):
 
-        ckpt = self.config.model.pop("check_point", None)
-        pretrain_config = self.config.model.pop('pretrain')
-        pretrained_gnn = Mono(**pretrain_config['model_config'])
-        pretrained_gnn.load_ckpt(pretrain_config['ckpt_path'])
-        self.model = MolMix(pretrained_gnn, **self.config.model['model'])
+        # The original Bamboo generator trains a diffusion model and a BOW
+        # decoder on precomputed FormulaData embeddings.  Keep the prediction
+        # path unchanged, while restoring those two model types so candidate
+        # pools with a different vocabulary can be compared fairly.
+        model_type = self.config.model.pop("model_type", "predictor")
+        if model_type == "diffusion":
+            ckpt = self.config.model.pop("check_point", None)
+            self.model = FormulaDiffusion(
+                **self.config.model["diffusion_model_config"])
+        elif model_type == "decoder":
+            ckpt = self.config.model.pop("check_point", None)
+            self.model = FormulaDecoder(
+                **self.config.model["decoder_model_config"])
+        elif model_type == "predictor":
+            ckpt = self.config.model.pop("check_point", None)
+            pretrain_config = self.config.model.pop('pretrain')
+            pretrained_gnn = Mono(**pretrain_config['model_config'])
+            pretrained_gnn.load_ckpt(pretrain_config['ckpt_path'])
+            self.model = MolMix(pretrained_gnn, **self.config.model['model'])
+        else:
+            raise ValueError(f"unknown formula model_type: {model_type}")
 
         self.model.to(self.device)
         return ckpt

@@ -62,7 +62,8 @@ class SinusoidalTimeEmbeddings(nn.Module):
 class FormulaDiffusion(nn.Module):
 
     def __init__(self, unet1d_config: dict, beta_scheduler_config: dict,
-                 sigma_scheduler_config: dict, diff_config: dict) -> None:
+                 sigma_scheduler_config: dict, diff_config: dict,
+                 embedding_dim: int = 384) -> None:
         super().__init__()
 
         self.noise_predictor = Unet1D(**unet1d_config)
@@ -70,6 +71,7 @@ class FormulaDiffusion(nn.Module):
         self.beta_scheduler = BetaScheduler(**beta_scheduler_config)
         self.sigma_scheduler = SigmaScheduler(**sigma_scheduler_config)
         self.time_dim = diff_config.get("time_dim")
+        self.embedding_dim = int(embedding_dim)
 
         # self.prop_embedding = ScalarEmbed(diff_config.get("prop_embed_dim"))
 
@@ -111,7 +113,7 @@ class FormulaDiffusion(nn.Module):
         batch_size = prop.size()[0]
         device = next(self.noise_predictor.parameters()).device
 
-        e_T = torch.randn([batch_size, 1, 384]).to(device)
+        e_T = torch.randn([batch_size, 1, self.embedding_dim]).to(device)
 
         time_start = self.beta_scheduler.timesteps
 
