@@ -16,6 +16,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
 
 
 GROUP_LABELS = {
@@ -26,6 +27,27 @@ GROUP_LABELS = {
 }
 GROUPS = tuple(GROUP_LABELS)
 MAX_TRUSTED_CONDUCTIVITY = 100.0
+DENSITY_CMAP = LinearSegmentedColormap.from_list(
+    "density_blue_to_red", ["#2563eb", "#dc2626"])
+DENSITY_CMAP.set_bad("white")
+GROUP_DESIGNS = {
+    "G0": {
+        "source": "Bamboo-Mixer 发布的 diffusion + decoder checkpoint；固定 Bamboo 62 溶剂、2 盐词表",
+        "goal": "作为不使用本研究候选池筛选与解释约束的基线，衡量原版生成器在同一冻结 oracle 下的输出分布。",
+    },
+    "G1": {
+        "source": "从分子预训练数据的 20000 个候选中随机/多样性抽取 62 个分子；重新训练同规格 diffusion + decoder",
+        "goal": "检验仅更换为随机且结构多样的分子库，能否改善目标电导率与阴离子比例的生成结果。",
+    },
+    "G2": {
+        "source": "从相同 20000 个候选中按片段贡献和分子物性软约束筛出 62 个分子；重新训练同规格 diffusion + decoder",
+        "goal": "检验解释导出的结构与物性约束是否能将生成分布推向更可信、更接近目标的配方区域。",
+    },
+    "G3": {
+        "source": "复用 G2 生成器与候选池，在温度—浓度网格上进行鲁棒重排序",
+        "goal": "检验后处理的鲁棒排序能否提高有限实验预算下候选的可用性。",
+    },
+}
 
 
 def read_csv(path):
@@ -58,15 +80,19 @@ def trusted_record(row):
             and 0.0 <= float(value) <= MAX_TRUSTED_CONDUCTIVITY)
 
 
-def formula_smiles(row, solvents, threshold=.02):
-    """Readable solvent-mixture label using SMILES rather than vocabulary names."""
+def formula_label(row, solvents, group, threshold=.02):
+    """Use Bamboo names for G0 and SMILES for pool-derived G1/G2 formulas."""
     bow = np.asarray(row["bow"], dtype=float)
     terms = []
     for index in np.where(bow[:len(solvents)] > threshold)[0]:
-        terms.append(f"{solvents[index]['smiles']} ({bow[index]:.2f})")
+        identity = (solvents[index]["name"] if group == "G0"
+                    else solvents[index]["smiles"])
+        terms.append(f"{identity} ({bow[index]:.2f})")
     if not terms:
         index = int(np.argmax(bow[:len(solvents)]))
-        terms.append(f"{solvents[index]['smiles']} ({bow[index]:.2f})")
+        identity = (solvents[index]["name"] if group == "G0"
+                    else solvents[index]["smiles"])
+        terms.append(f"{identity} ({bow[index]:.2f})")
     return " + ".join(terms)
 
 
@@ -86,14 +112,19 @@ def summarize_group(root, group, target, selection_budget):
         return None
     values = np.asarray([float(records[index]["conductivity_pred_ms_cm"])
                          for index in trusted_ids])
-    rank = np.asarray([
-        float(records[index].get("candidate_rank_score",
-                                 records[index]["conductivity_pred_ms_cm"]))
-        for index in trusted_ids
+    ranked_ids = np.asarray([
+        index for index in trusted_ids
+        if records[index].get("candidate_rank_score") is not None
+        and np.isfinite(float(records[index]["candidate_rank_score"]))
     ])
-    selected_positions = np.argsort(-rank)[:min(selection_budget, len(trusted_ids))]
-    selected_ids = trusted_ids[selected_positions]
-    selected_values = values[selected_positions]
+    rank = np.asarray([float(records[index]["candidate_rank_score"])
+                       for index in ranked_ids])
+    selected_positions = np.argsort(-rank)[:min(selection_budget, len(ranked_ids))]
+    selected_ids = ranked_ids[selected_positions]
+    selected_values = np.asarray([
+        float(records[index]["conductivity_pred_ms_cm"])
+        for index in selected_ids
+    ])
     trusted_records = [records[index] for index in trusted_ids]
     solvent_counts, dominant = [], []
     formula_keys = []
@@ -105,6 +136,17 @@ def summarize_group(root, group, target, selection_budget):
         formula_keys.append("+".join(
             f"{solvents[i]['name']}:{bow[i]:.2f}" for i in active))
     robust_min = [row.get("robust_min_ms_cm") for row in trusted_records]
+    predicted_ratios = np.asarray([
+        float(row["anion_ratio_pred"]) for row in trusted_records
+        if row.get("anion_ratio_pred") is not None
+        and np.isfinite(float(row["anion_ratio_pred"]))
+    ])
+    condition = float(records[0].get("anion_ratio_condition", .5))
+    selected_ratios = np.asarray([
+        float(records[index]["anion_ratio_pred"]) for index in selected_ids
+        if records[index].get("anion_ratio_pred") is not None
+        and np.isfinite(float(records[index]["anion_ratio_pred"]))
+    ])
     return {
         "group": group,
         "group_label": GROUP_LABELS[group],
@@ -126,6 +168,8 @@ def summarize_group(root, group, target, selection_budget):
             "target_mS_cm": target,
             "all_hit_count": int(np.sum(values >= target)),
             "all_hit_rate": float(np.mean(values >= target)),
+            "near_target_rate_pm2": float(np.mean(np.abs(values - target) <= 2.0)),
+            "mean_abs_target_gap_mS_cm": float(np.mean(np.abs(values - target))),
             "selected_budget": len(selected_ids),
             "selected_hit_count": int(np.sum(selected_values >= target)),
             "selected_hit_rate": float(np.mean(selected_values >= target)),
@@ -136,6 +180,22 @@ def summarize_group(root, group, target, selection_budget):
             "unique_compositions": len(set(formula_keys)),
             "mean_active_solvents": float(np.mean(solvent_counts)),
             "top_dominant_solvent": Counter(dominant).most_common(1)[0][0],
+            "anion_ratio_pred_mae_from_condition": (
+                float(np.mean(np.abs(predicted_ratios - condition)))
+                if len(predicted_ratios) else ""
+            ),
+            "anion_ratio_pred_within_pm0.1": (
+                float(np.mean(np.abs(predicted_ratios - condition) <= .1))
+                if len(predicted_ratios) else ""
+            ),
+            "selected_anion_ratio_pred_mae_from_condition": (
+                float(np.mean(np.abs(selected_ratios - condition)))
+                if len(selected_ratios) else ""
+            ),
+            "selected_anion_ratio_pred_within_pm0.1": (
+                float(np.mean(np.abs(selected_ratios - condition) <= .1))
+                if len(selected_ratios) else ""
+            ),
             "g3_robust_min_median_mS_cm": (
                 float(np.median([x for x in robust_min if x is not None]))
                 if any(x is not None for x in robust_min) else ""),
@@ -233,7 +293,7 @@ def top_near_target(result, target, limit=10):
     """Keep the closest unique solvent mixtures, not repeated diffusion samples."""
     unique = {}
     for record in result["trusted_records"]:
-        label = formula_smiles(record, result["solvents"])
+        label = formula_label(record, result["solvents"], result["group"])
         value = float(record["conductivity_pred_ms_cm"])
         candidate = (abs(value - target), value, record, label)
         if label not in unique or candidate[:2] < unique[label][:2]:
@@ -282,36 +342,86 @@ def save_top_near_target(result, out, target):
     return rows
 
 
-def save_anion_ratio_distribution(result, out, target):
-    """Plot oracle-predicted anion ratio against conductivity per group."""
+def conductivity_anion_density(result):
+    """Fixed-axis density; normalizing by all samples exposes OOD loss."""
     pairs = [(float(row["conductivity_pred_ms_cm"]),
               float(row["anion_ratio_pred"]))
              for row in result["trusted_records"]
              if row.get("anion_ratio_pred") is not None
              and np.isfinite(float(row["anion_ratio_pred"]))]
     if not pairs:
-        return False
+        return None
     values, ratios = (np.asarray(item) for item in zip(*pairs))
-    hit = values >= target
-    fig, ax = plt.subplots(figsize=(7.2, 5.4))
-    ax.scatter(values[~hit], ratios[~hit], s=22, alpha=.48, c="#6b7280",
-               label="below target")
-    ax.scatter(values[hit], ratios[hit], s=25, alpha=.70, c="#dc2626",
-               label="target hit")
+    x_edges = np.linspace(0.0, MAX_TRUSTED_CONDUCTIVITY, 31)
+    y_edges = np.linspace(0.0, 1.0, 26)
+    counts, _, _ = np.histogram2d(values, ratios, bins=(x_edges, y_edges))
+    return counts.T / len(result["records"]), x_edges, y_edges
+
+
+def save_anion_ratio_distribution(result, out, target):
+    """Density map of oracle-predicted conductivity and anion ratio."""
+    density = conductivity_anion_density(result)
+    if density is None:
+        return False
+    matrix, x_edges, y_edges = density
+    matrix = np.ma.masked_less_equal(matrix, 0.0)
+    fig, ax = plt.subplots(figsize=(7.4, 5.6))
+    image = ax.pcolormesh(x_edges, y_edges, matrix, cmap=DENSITY_CMAP,
+                          shading="auto")
+    colorbar = fig.colorbar(image, ax=ax, pad=.02)
+    colorbar.set_label("Density (fraction of all generated formulas per bin)")
     ax.axvline(target, color="#dc2626", ls="--", lw=1.2,
                label=f"target = {target:g} mS/cm")
     condition = result["trusted_records"][0].get("anion_ratio_condition")
     if condition is not None:
-        ax.axhline(float(condition), color="#2563eb", ls=":", lw=1.4,
+        ax.axhline(float(condition), color="white", ls=":", lw=1.4,
                    label=f"generation condition = {float(condition):g}")
-    ax.set_xlim(left=0)
-    ax.set_ylim(-.02, 1.02)
+    ax.set_xlim(0, MAX_TRUSTED_CONDUCTIVITY)
+    ax.set_ylim(0, 1)
     ax.set_xlabel("Frozen-oracle predicted conductivity (mS/cm)")
     ax.set_ylabel("Frozen-oracle predicted anion ratio")
-    ax.set_title(f"{result['group']}: generated formula distribution")
+    ax.set_title(f"{result['group']}: conductivity–anion-ratio density")
     ax.grid(alpha=.22)
     ax.legend(frameon=False, fontsize=8)
+    ax.text(.02, .97,
+            f"trusted / sampled = {len(result['trusted_records'])} / {len(result['records'])}",
+            transform=ax.transAxes, va="top", ha="left", fontsize=8,
+            bbox={"facecolor": "white", "alpha": .75, "edgecolor": "none"})
     fig.tight_layout()
+    fig.savefig(out, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def save_anion_ratio_density_comparison(results, out, target):
+    """Shared-scale density panels for comparing the generated regions."""
+    prepared = [(result, conductivity_anion_density(result)) for result in results]
+    prepared = [(result, item) for result, item in prepared if item is not None]
+    if not prepared:
+        return False
+    vmax = max(float(item[0].max()) for _, item in prepared)
+    fig, axes = plt.subplots(1, len(prepared), figsize=(5.5 * len(prepared), 4.9),
+                             sharex=True, sharey=True, squeeze=False)
+    image = None
+    for ax, (result, (matrix, x_edges, y_edges)) in zip(axes.flat, prepared):
+        matrix = np.ma.masked_less_equal(matrix, 0.0)
+        image = ax.pcolormesh(x_edges, y_edges, matrix, cmap=DENSITY_CMAP,
+                              shading="auto", vmin=0, vmax=vmax)
+        ax.axvline(target, color="#dc2626", ls="--", lw=1.1)
+        condition = result["trusted_records"][0].get("anion_ratio_condition")
+        if condition is not None:
+            ax.axhline(float(condition), color="white", ls=":", lw=1.2)
+        ax.set_title(result["group"])
+        ax.set_xlim(0, MAX_TRUSTED_CONDUCTIVITY)
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=.18)
+        ax.set_xlabel("Predicted conductivity (mS/cm)")
+    axes[0][0].set_ylabel("Frozen-oracle predicted anion ratio")
+    fig.subplots_adjust(left=.07, right=.87, bottom=.14, top=.82, wspace=.10)
+    colorbar_axis = fig.add_axes([.89, .19, .015, .56])
+    colorbar = fig.colorbar(image, cax=colorbar_axis)
+    colorbar.set_label("Density (fraction of all generated formulas per bin)")
+    fig.suptitle("G0–G2 generated conductivity–anion-ratio coverage", y=.96)
     fig.savefig(out, dpi=240, bbox_inches="tight")
     plt.close(fig)
     return True
@@ -350,18 +460,21 @@ def main():
     parser.add_argument("--experiment-root", default="run/generation_experiments")
     parser.add_argument("--target-conductivity", type=float, default=20.)
     parser.add_argument("--selection-budget", type=int, default=100)
+    parser.add_argument("--groups", nargs="+", choices=GROUPS,
+                        default=list(GROUPS),
+                        help="Groups to summarize; defaults to every available group.")
     args = parser.parse_args()
     root = Path(args.experiment_root)
     root.mkdir(parents=True, exist_ok=True)
     results = [summarize_group(root, group, args.target_conductivity, args.selection_budget)
-               for group in GROUPS]
+               for group in args.groups]
     results = [x for x in results if x is not None]
     if not results:
         raise SystemExit(f"No generated_formulas.json found under {root}")
     summary = [x["summary"] for x in results]
     write_csv(root / "generation_experiment_summary.csv", summary)
     timing_rows = []
-    for group in GROUPS:
+    for group in args.groups:
         timing, _ = timing_summary(root, group)
         if timing is not None:
             timing_rows.append(timing)
@@ -382,84 +495,84 @@ def main():
             write_csv(csv_path, top_rows)
             top_figures.append((group, csv_path.name,
                                 f"top10_near_{args.target_conductivity:g}_mS_cm_{group}.png"))
-        anion_path = root / f"anion_ratio_vs_conductivity_{group}.png"
+        anion_path = root / f"conductivity_anion_density_{group}.png"
         if save_anion_ratio_distribution(result, anion_path,
                                          args.target_conductivity):
             anion_figures.append((group, anion_path.name))
+    density_comparison = root / "conductivity_anion_density_comparison.png"
+    has_density_comparison = save_anion_ratio_density_comparison(
+        results, density_comparison, args.target_conductivity)
     if timing_rows:
         save_runtime(timing_rows, root / "generation_runtime.png")
 
+    design_rows = [{"group": result["group"],
+                    "生成器/候选池": GROUP_DESIGNS[result["group"]]["source"],
+                    "研究目标": GROUP_DESIGNS[result["group"]]["goal"]}
+                   for result in results]
     report = [
-        "# G0–G3 生成实验结果汇总", "",
-        f"共同条件：目标电导率 **{args.target_conductivity:g} mS/cm**；条件阴离子比例 **0.5**；"
-        "生成时温度 25 °C、salt_molar_ratio 0.10。G3 额外在 25–55 °C、0.05–0.15 的网格上复核。",
+        "# G0–G2 联合条件生成实验结果", "",
+        f"共同采样条件：目标电导率 **{args.target_conductivity:g} mS/cm**、条件阴离子比例 **0.5**、"
+        "温度 25 °C、salt_molar_ratio 0.10；每组生成 1024 个候选并由同一冻结配方 oracle 复评分。",
         "",
-        "## G0–G3 的设计与区别", "",
-        "四组在目标电导率、温度、盐浓度、候选数和冻结配方 oracle 上保持一致；差别只来自候选池构建方式、生成器来源或最终排序规则。"
-        "当前阴离子比例条件固定为 0.5。",
+        "## 研究目标与分组设计", "",
+        markdown_table(design_rows, ["group", "生成器/候选池", "研究目标"]), "",
+        "G0 不重训生成器；G1/G2 都使用 62 个溶剂和 2 个盐的候选词表、30,000 条合成配方标签与同规格 diffusion/decoder。"
+        "G1 的异常 oracle 标签采用数值回退保留，G2 则采用严格的联合条件可信样本筛选；因此二者是候选池策略对照，但应同时报告域外比例，不能只比较命中率。",
         "",
-        "| 组别 | 生成器/候选池 | 核心目的 | 与其余组的可比点 |",
-        "| --- | --- | --- | --- |",
-        "| G0 | Bamboo 发布的 diffusion + decoder checkpoint；Bamboo 原始 62 溶剂、2 盐词表 | 作为不使用本研究解释约束的基线 | 不重训 generator；用同一冻结 oracle 复评分 |",
-        "| G1 | 从分子预训练数据随机抽取并做结构多样化的 62 分子候选池；同规格 generator 重训 | 评估仅扩大/随机选择分子库的效果 | 与 G2 使用相同词表大小、合成样本数、训练上限和采样数 |",
-        "| G2 | 用片段贡献与分子物性软约束筛出的 62 分子候选池；同规格 generator 重训 | 检验解释导出的结构/物性约束能否提升命中质量 | 不直接用测试集电导率标签筛分子 |",
-        "| G3 | 复用 G2 generator 与候选池，不新训练；按 25–55 °C、0.05–0.15 浓度网格的最差电导率，并以解释方向稳定性同分决策 | 检验鲁棒重排序能否提高候选可用性 | 原始生成分布与 G2 相同，只有最终候选排序不同 |",
+        "## 指标汇总", "",
+        markdown_table(summary, ["group", "n_sampled", "n_trusted", "n_out_of_domain", "all_hit_rate", "near_target_rate_pm2", "mean_abs_target_gap_mS_cm", "selected_budget", "selected_hit_rate", "all_p90_mS_cm", "unique_compositions", "anion_ratio_pred_mae_from_condition", "anion_ratio_pred_within_pm0.1"]),
         "",
-        "",
-        "## 电导率与命中率", "",
-        markdown_table(summary, ["group", "policy", "n_sampled", "n_trusted", "n_out_of_domain", "all_hit_rate", "selected_budget", "selected_hit_rate", "selected_mean_mS_cm", "all_p90_mS_cm", "unique_compositions", "top_dominant_solvent"]),
-        "",
-        "### 字段含义", "",
-        "| 字段 | 含义与用途 |",
+        "### 参数与指标含义", "",
+        "| 参数/指标 | 含义与使用意义 |",
         "| --- | --- |",
-        "| group | 实验组编号。G0–G3 的具体设计见上表。 |",
-        "| policy | 该组的候选池、生成器来源和排序策略的简述。 |",
-        "| n_sampled | 扩散模型实际生成、并送入冻结 oracle 评分的配方总数。 |",
-        "| n_trusted | 预测电导率在 0–100 mS/cm 内的样本数，可用于定量比较。 |",
-        "| n_out_of_domain | 预测为非有限数或超过 100 mS/cm 的样本数，视为冻结 oracle 的域外外推并排除。 |",
-        "| all_hit_rate | 全部可信生成样本中，预测电导率达到目标 20 mS/cm 的比例，反映原始生成分布的命中能力。 |",
-        "| selected_budget | 各组用于后续筛选比较的相同候选数；本实验固定为 100。 |",
-        "| selected_hit_rate | 按该组既定排序规则选出的前 `selected_budget` 个候选中，达到目标的比例，反映筛选策略的价值。 |",
-        "| selected_mean_mS_cm | 入选候选的平均预测电导率；仅作辅助描述，不代替命中率或实验验证。 |",
-        "| all_p90_mS_cm | 所有可信样本电导率的第 90 百分位数，表示高端 10% 样本的分界。 |",
-        "| unique_compositions | 以“活性溶剂及其摩尔比例”去重后的配方数，数值越高说明重复生成越少。 |",
-        "| top_dominant_solvent | 全部可信配方中，占摩尔比例最大的溶剂最常出现的词表名称；仅用于观察生成偏好，不代表因果结论。 |",
-        "",
-        "`all_hit_rate` 衡量**生成**是否容易产生达标配方；`selected_hit_rate` 衡量在相同实验预算下，**排序/筛选**能否把达标候选优先排到前面。"
-        "对 G3 而言，后者特别反映温度—浓度鲁棒重排序的价值，不能把它当作原始生成分布改变的证据。",
+        "| target conductivity | 扩散模型外部条件中的目标电导率；本次为 20 mS/cm。它不是实验实测值，而是生成方向。 |",
+        "| anion_ratio_condition | 扩散模型外部条件中的阴离子比例；本次固定 0.5。 |",
+        "| conductivity_pred_ms_cm | 冻结 oracle 对解码后配方给出的物理空间电导率预测，用于统一比较。 |",
+        "| anion_ratio_pred | 冻结 oracle 对同一配方推断的阴离子比例，用于检查生成条件是否被保持。 |",
+        "| temperature_c / salt_molar_ratio | 送入 oracle 复评分的温度与盐浓度条件；本次统一固定为 25 °C 与 0.10，故不是本轮生成器主动探索的变量。 |",
+        "| bow | decoder 输出的候选词表组成向量；前段为溶剂比例、后段为盐比例。它用于还原具体配方与统计组成多样性。 |",
+        "| candidate_rank_score | 候选排序分数；G0–G2 当前等同或主要来自 oracle 电导率评分，用于选出有限实验预算下的前 100 个，不能视为独立实验标签。 |",
+        "| prediction_status | `trusted` 表示可用于定量比较；`out_of_domain` 表示电导率非有限或超出 0–100 mS/cm，保留在原始生成数中但不参与密度与命中统计。 |",
+        "| explanation_residual_25c | 当前解释头在 25 °C 给出的电导率残差项；本报告未以其作为 G0–G2 主排序标准，只保留用于后续机制复核。 |",
+        "| n_sampled / n_trusted / n_out_of_domain | 总生成数 / 电导率在 0–100 mS/cm 且数值有限的可信数 / 其余域外数。域外数高意味着候选更可能超出 oracle 的可靠适用域。 |",
+        "| all_hit_rate | 所有可信样本中 conductivity_pred_ms_cm ≥ 20 的比例，衡量原始生成分布产生达标候选的能力。 |",
+        "| near_target_rate_pm2 | 电导率落在 [18, 22] mS/cm 的比例，衡量是否真正围绕目标，而不是单纯越高越好。 |",
+        "| mean_abs_target_gap_mS_cm | 与 20 mS/cm 的平均绝对偏差；越小表示整体更接近指定目标。 |",
+        "| selected_hit_rate | 按 candidate_rank_score 选前 100 个后的达标比例，衡量有限实验预算下的排序价值。 |",
+        "| unique_compositions | 按活性溶剂与比例去重后的配方数，衡量生成多样性而非重复抽样。 |",
+        "| anion_ratio_pred_mae_from_condition / within_pm0.1 | 预测阴离子比例距条件 0.5 的平均偏差 / 落在 0.5±0.1 内的比例，用于检查联合条件可控性。 |",
         "",
         "![Conductivity coverage](conductivity_coverage_heatmap.png)", "",
         "![Target hit rate](target_hit_rate.png)", "",
         "![Formula range](generated_formula_range.png)", "",
-        "### 图的解读", "",
-        "- `conductivity_coverage_heatmap.png`：每行是一组，颜色/数值表示该组可信生成配方落入各电导率区间的比例；20 mS/cm 及右侧区间为达标区。",
-        "- `target_hit_rate.png`：左柱为所有可信样本的达标比例（生成能力），右柱为统一取前 100 个候选后的达标比例（筛选能力）。它回答的是“在相同后续实验预算下，哪组更容易把达标配方排到前面”。",
-        "- `generated_formula_range.png`：横坐标为配方中有效溶剂数，纵坐标为冻结 oracle 预测电导率；灰点未达标、红点达标、红虚线为 20 mS/cm。它用于查看高电导率是否只来自单溶剂，还是也可由二元/三元溶剂体系得到。图已改为 2×2 面板并将图例移到底部，避免标题和标注重合。",
+        "这些补充图分别展示电导率区间覆盖、达标率与有效溶剂数—电导率关系；其中达标率必须结合可信样本数与域外比例一起解释。",
         "",
-        "## 目标附近的具体生成配方", "",
-        "下图对每组先按 SMILES+摩尔比例去重，再选取预测电导率与 20 mS/cm 绝对差最小的 10 个配方。"
-        "橙色表示略低于目标、蓝色表示略高于目标；虚线是 20 mS/cm。图和 CSV 均用 SMILES 表示溶剂，不依赖词表名称。",
+        "## 电导率—阴离子比例二维密度", "",
+        "横轴为冻结 oracle 预测电导率，纵轴为 oracle 预测阴离子比例；红虚线是 20 mS/cm，白点虚线是输入条件 0.5。"
+        "色条表示每个二维 bin 占全部 1024 个生成配方的比例，故域外样本不会因重新归一化而被隐藏。",
         "",
-        *sum(([f"### {group}", f"![{group} top-10]({figure})", f"配方数据：[CSV]({csv_name})", ""]
-               for group, csv_name, figure in top_figures), []),
-        "## 阴离子比例—电导率分布", "",
-        "下图复现 Bamboo 图 3b 的输出逻辑：横轴为冻结 oracle 预测电导率，纵轴为同一 oracle 对生成配方输出的 `anion_ratio_pred`。"
-        "蓝色虚线是 diffusion 的输入条件 0.5；散点纵向分散并不表示 diffusion 在生成时自由采样了条件值，而是表示不同生成配方经配方预测器推断出的阴离子比例不同。"
-        "因此它可用于检查“条件为 0.5 时，解码出的组成是否仍集中在该比例附近”，但不能替代多条件（0.3/0.5/0.7）生成实验。",
+    ]
+    if has_density_comparison:
+        report.extend(["![G0–G2 density comparison](conductivity_anion_density_comparison.png)", ""])
+    for group, figure in anion_figures:
+        report.extend([f"### {group}", f"![{group} density]({figure})", ""])
+    report.extend([
+        "## 目标附近的具体配方", "",
+        "每组先按组成去重，再取预测电导率最接近 20 mS/cm 的 10 个配方。G0 使用 Bamboo 词表名称；G1/G2 使用 SMILES，括号内为该溶剂在配方中的摩尔比例。"
+        "图采用单行换行标签和加宽左边距，避免不同配方文字重叠。",
         "",
-        *sum(([f"### {group}", f"![{group} anion-ratio distribution]({figure})", ""]
-               for group, figure in anion_figures), []),
-        "若要比较 anion ratio 条件本身的可控性，仍应在多个外部指定条件下重复 G0–G3 采样；对 G1/G2，这需要用多比例的合成训练配方重训 generator。",
-        "",
+    ])
+    for group, csv_name, figure in top_figures:
+        report.extend([f"### {group}", f"![{group} top-10]({figure})", f"配方明细：[CSV]({csv_name})", ""])
+    report.extend([
         "## 运行时间", "",
         markdown_table(timing_rows, ["group", "candidate_pool_seconds", "vocabulary_embedding_seconds", "synthetic_formula_oracle_seconds", "train_diffusion_seconds", "train_decoder_seconds", "sample_and_score_seconds", "total_executed_seconds"]) if timing_rows else "尚无 timing CSV。",
         "",
         "![Runtime](generation_runtime.png)" if timing_rows else "",
         "",
-        "## 解释与边界", "",
-        "G2 的候选池仅以解释报告导出的片段和分子物性软约束筛选，不直接读取测试集电导率标签；G3 使用固定解释头的残差方向稳定性作为同分时的次级排序依据。"
-        "生成器的合成训练标签和最终打分目前均来自同一个冻结配方 oracle，因此这是**内部设计比较**，而不是独立泛化性能估计。正式论文比较应再用未参与 generator 标签构造的独立 predictor 或实验验证候选。",
-    ]
+        "## 解释边界", "",
+        "G2 的筛选来自片段归因和分子物性软约束，而非直接用测试集电导率标签选分子。当前合成标签与最终复评分均来自同一个冻结 oracle，故报告用于 G0–G2 的内部设计比较；最终实验结论仍需独立 predictor 或实验验证。",
+    ])
     (root / "generation_experiment_report_zh.md").write_text("\n".join(report) + "\n", encoding="utf-8")
     print(f"Wrote summary, timing table, figures, and report to {root}")
 

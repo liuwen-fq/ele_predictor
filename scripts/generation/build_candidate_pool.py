@@ -10,6 +10,7 @@ label is read here.
 import argparse
 import csv
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -17,7 +18,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from rdkit import Chem
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
+from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from formula_design.data import MonoData, collate_data
 from formula_design.mol import Molecule
@@ -46,20 +49,35 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def valid_candidate(entry):
+def candidate_ineligibility_reason(entry):
+    """Return a label-independent common-eligibility failure, if any."""
     smiles = entry.get("smiles", "")
     if not smiles or "." in smiles:
-        return False
+        return "missing_or_multicomponent_smiles"
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None or Chem.GetFormalCharge(mol) != 0:
-        return False
+    if mol is None:
+        return "rdkit_parse_failed"
+    if Chem.GetFormalCharge(mol) != 0:
+        return "non_neutral"
     if not 3 <= mol.GetNumHeavyAtoms() <= 40:
-        return False
+        return "heavy_atom_count_outside_3_40"
     allowed = {"C", "N", "O", "F", "P", "S", "Cl", "Br", "Si"}
-    return all(atom.GetSymbol() in allowed for atom in mol.GetAtoms())
+    if not all(atom.GetSymbol() in allowed for atom in mol.GetAtoms()):
+        return "unsupported_element"
+    try:
+        Molecule.from_smiles(smiles).get_mapped_smiles()
+    except Exception:
+        return "molecule_encoder_mapping_failed"
+    return None
 
 
-def structural_score(smiles):
+def fragment_profile(smiles):
+    """Return explanation-derived fragment terms without a top-k bias.
+
+    Positive terms are later scored as a *marginal* gain relative to the
+    molecules already selected.  Risks stay per-molecule penalties: selecting
+    one risky molecule must not make later risky molecules less risky.
+    """
     mol = Chem.MolFromSmiles(smiles)
     patterns = {
         "nitrile": ("[C]#[N]", 1.0),
@@ -74,19 +92,38 @@ def structural_score(smiles):
         # the appropriate later constraints.
         "carbonate_contextual": ("[OX2][CX3](=O)[OX2]", 0.0),
     }
-    details, score = [], 0.0
+    details, positive_terms, risk_score = [], {}, 0.0
     for name, (smarts, weight) in patterns.items():
         if mol.HasSubstructMatch(Chem.MolFromSmarts(smarts)):
             details.append(name)
-            score += weight
+            if weight > 0:
+                positive_terms[name] = weight
+            elif weight < 0:
+                risk_score += weight
     if (mol.HasSubstructMatch(Chem.MolFromSmarts("[OD2]([#6])[#6]"))
             and sum(atom.GetSymbol() == "F" for atom in mol.GetAtoms()) >= 2):
         details.append("fluorinated_ether_risk")
-        score -= 0.8
+        risk_score -= 0.8
     if any(bond.IsInRing() for bond in mol.GetBonds()) and "ester" in details:
         details.append("lactone_bonus")
-        score += 0.8
-    return score, ";".join(details) or "none"
+        positive_terms["lactone_bonus"] = 0.8
+    # Functional-family coverage is intentionally coarser than individual
+    # terms.  It captures repeated nitrile-esters/lactones that can pass a
+    # molecule-level Tanimoto threshold but still form one chemical family.
+    family_tags = [name for name in ("nitrile", "ester", "ether", "lactone_bonus")
+                   if name in positive_terms]
+    if not family_tags:
+        family_tags = ["other"]
+    scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol) or "acyclic"
+    return {
+        "positive_terms": positive_terms,
+        "risk_score": risk_score,
+        "details": ";".join(details) or "none",
+        "functional_family": "+".join(family_tags),
+        "murcko_scaffold": scaffold,
+        "fingerprint": AllChem.GetMorganFingerprintAsBitVect(
+            mol, radius=2, nBits=2048),
+    }
 
 
 def load_mono(model_config_path, checkpoint):
@@ -126,6 +163,7 @@ def predict_properties(entries, model, batch_size):
 
 
 def property_score(values, constraints):
+    """A flat, soft property window; values inside get no extra extremum bonus."""
     score, details = 0.0, []
     for row in constraints:
         name = row["property"]
@@ -138,6 +176,82 @@ def property_score(values, constraints):
         score += 1.0 - min(distance, 2.0)
         details.append(f"{name}={value:.4g}")
     return score, ";".join(details)
+
+
+def concave_marginal(count, amount=1):
+    """Automatic diminishing-return gain for repeated family/fragment use."""
+    return math.log1p(count + amount) - math.log1p(count)
+
+
+def guided_coverage_top(rows, pool_size, seed, property_weight,
+                        fragment_weight, family_coverage_weight,
+                        scaffold_coverage_weight, redundancy_weight):
+    """Greedily select explanation-guided molecules by current marginal gain.
+
+    No fragment has a hard occurrence limit.  Its gain follows ``log(1+n)``:
+    the second and later representatives remain eligible, but must justify
+    themselves against unused families and lower-redundancy alternatives.
+    """
+    from collections import Counter
+
+    rng = random.Random(seed)
+    remaining = [dict(row, _tie_break=rng.random()) for row in rows]
+    selected, fingerprints = [], []
+    term_counts, family_counts, scaffold_counts = Counter(), Counter(), Counter()
+    while len(selected) < pool_size:
+        best, best_terms = None, None
+        for row in remaining:
+            profile = row["_profile"]
+            max_similarity = max((DataStructs.TanimotoSimilarity(
+                profile["fingerprint"], old) for old in fingerprints), default=0.0)
+            fragment_gain = sum(
+                weight * concave_marginal(term_counts[term])
+                for term, weight in profile["positive_terms"].items())
+            family_gain = family_coverage_weight * concave_marginal(
+                family_counts[profile["functional_family"]])
+            scaffold_gain = 0.0
+            if profile["murcko_scaffold"] != "acyclic":
+                scaffold_gain = scaffold_coverage_weight * concave_marginal(
+                    scaffold_counts[profile["murcko_scaffold"]])
+            redundancy_penalty = redundancy_weight * max_similarity
+            marginal = (
+                property_weight * row["property_window_score"]
+                + fragment_weight * fragment_gain
+                + profile["risk_score"]
+                + family_gain + scaffold_gain - redundancy_penalty)
+            key = (marginal, -row["_tie_break"])
+            if best is None or key > best[0]:
+                best = (key, row, max_similarity, fragment_gain, family_gain,
+                        scaffold_gain, redundancy_penalty, marginal)
+                best_terms = profile["positive_terms"]
+        _, row, max_similarity, fragment_gain, family_gain, scaffold_gain, penalty, marginal = best
+        profile = row.pop("_profile")
+        row.pop("_tie_break")
+        row.update({
+            "selection": "guided_coverage_v1",
+            "fragment_score": sum(profile["positive_terms"].values()) + profile["risk_score"],
+            "fragment_risk_score": profile["risk_score"],
+            "selected_fragment_marginal": fragment_gain,
+            "family_coverage_gain": family_gain,
+            "scaffold_coverage_gain": scaffold_gain,
+            "redundancy_penalty": penalty,
+            "max_tanimoto_to_earlier": max_similarity,
+            "selection_marginal_score": marginal,
+            "total_score": marginal,
+            "matched_structure_terms": profile["details"],
+            "functional_family": profile["functional_family"],
+            "murcko_scaffold": profile["murcko_scaffold"],
+            "selected_step": len(selected) + 1,
+        })
+        selected.append(row)
+        fingerprints.append(profile["fingerprint"])
+        family_counts[profile["functional_family"]] += 1
+        if profile["murcko_scaffold"] != "acyclic":
+            scaffold_counts[profile["murcko_scaffold"]] += 1
+        for term in best_terms:
+            term_counts[term] += 1
+        remaining.remove(row)
+    return selected
 
 
 def diverse_top(rows, pool_size, seed):
@@ -168,12 +282,23 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--baseline-solvents", required=True)
     parser.add_argument("--salts", required=True)
-    parser.add_argument("--mono-data")
+    parser.add_argument("--mono-data", help="Legacy raw pretraining source.")
+    parser.add_argument("--candidate-source",
+                        help="Reusable common eligible-pool JSON.")
     parser.add_argument("--property-constraints")
+    parser.add_argument("--guided-selection-strategy",
+                        choices=("legacy_topk", "coverage_v1"),
+                        default="coverage_v1")
+    parser.add_argument("--guided-property-weight", type=float, default=1.0)
+    parser.add_argument("--guided-fragment-weight", type=float, default=1.0)
+    parser.add_argument("--guided-family-coverage-weight", type=float, default=0.7)
+    parser.add_argument("--guided-scaffold-coverage-weight", type=float, default=0.25)
+    parser.add_argument("--guided-redundancy-weight", type=float, default=1.0)
     parser.add_argument("--model-config")
     parser.add_argument("--mono-checkpoint")
     parser.add_argument("--pool-size", type=int, default=62)
-    parser.add_argument("--screen-size", type=int, default=20000)
+    parser.add_argument("--screen-size", type=int,
+                        help="Optional seeded cap of the common pool; omit to use all.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--batch-size", type=int, default=256)
     args = parser.parse_args()
@@ -189,41 +314,88 @@ def main():
                  "selection": "fixed_bamboo_vocabulary", "total_score": ""}
                 for item in solvents]
     else:
-        if not args.mono_data:
-            raise ValueError("random/guided modes require --mono-data")
-        if args.mode == "guided" and not all((args.property_constraints,
-                                               args.model_config,
-                                               args.mono_checkpoint)):
-            raise ValueError("guided mode requires property constraints, model config, and checkpoint")
-        raw = json.loads(Path(args.mono_data).read_text())
+        if bool(args.mono_data) == bool(args.candidate_source):
+            raise ValueError("random/guided modes require exactly one of --mono-data or --candidate-source")
+        if not all((args.model_config, args.mono_checkpoint)):
+            raise ValueError(
+                "random/guided modes require model config and checkpoint for "
+                "the shared encoder/property eligibility preflight")
+        if args.mode == "guided" and not args.property_constraints:
+            raise ValueError("guided mode requires property constraints")
+        raw = json.loads(Path(args.candidate_source or args.mono_data).read_text())
         unique = {}
         for item in raw:
-            if valid_candidate(item):
-                unique.setdefault(item["smiles"], {"name": item["name"], "smiles": item["smiles"]})
-        candidates = list(unique.values())
-        rng = random.Random(args.seed)
-        rng.shuffle(candidates)
-        candidates = candidates[:args.screen_size]
+            smiles = item.get("smiles", "")
+            if smiles and smiles not in unique:
+                unique[smiles] = {"name": item.get("name", ""), "smiles": smiles}
+        basic_eligible, basic_rejected = [], []
+        for item in unique.values():
+            reason = candidate_ineligibility_reason(item)
+            if reason is None:
+                basic_eligible.append(item)
+            else:
+                basic_rejected.append({**item, "eligibility_status": "rejected",
+                                       "eligibility_reason": reason})
+        candidates = list(basic_eligible)
+        if args.screen_size is not None:
+            rng = random.Random(args.seed)
+            rng.shuffle(candidates)
+            candidates = candidates[:args.screen_size]
+        predictions = predict_properties(candidates, load_mono(
+            args.model_config, args.mono_checkpoint), args.batch_size)
+        eligible, preflight_rejected = [], []
+        for item in candidates:
+            values = predictions.get(item["name"])
+            if values is None:
+                preflight_rejected.append({**item, "eligibility_status": "rejected",
+                                           "eligibility_reason": "property_prediction_failed"})
+            elif not all(np.isfinite(value) for value in values.values()):
+                preflight_rejected.append({**item, "eligibility_status": "rejected",
+                                           "eligibility_reason": "nonfinite_property_prediction"})
+            else:
+                eligible.append({**item, "eligibility_status": "eligible",
+                                 "eligibility_reason": ""})
+        if len(eligible) < args.pool_size:
+            raise RuntimeError(
+                f"only {len(eligible)} commonly eligible molecules for pool size "
+                f"{args.pool_size}; increase --screen-size")
+        audit_rows = basic_rejected + preflight_rejected + eligible
+        write_csv(output / "candidate_eligibility_audit.csv", audit_rows)
+        write_csv(output / "eligible_pool.csv", eligible)
         if args.mode == "random":
             rows = diverse_top([{**item, "selection": "size_matched_random_diverse", "total_score": 0.0}
-                                for item in candidates], args.pool_size, args.seed)
+                                for item in eligible], args.pool_size, args.seed)
         else:
             constraints = read_csv(args.property_constraints)
-            predictions = predict_properties(candidates, load_mono(
-                args.model_config, args.mono_checkpoint), args.batch_size)
             scored = []
-            for item in candidates:
+            for item in eligible:
                 values = predictions.get(item["name"])
-                if values is None:
-                    continue
-                fragment, fragments = structural_score(item["smiles"])
+                profile = fragment_profile(item["smiles"])
                 prop, property_values = property_score(values, constraints)
                 scored.append({**item, "selection": "fragment_property_soft_constraints",
-                               "fragment_score": fragment, "property_score": prop,
-                               "total_score": fragment + prop,
-                               "matched_structure_terms": fragments,
-                               "predicted_properties": property_values})
-            rows = diverse_top(scored, args.pool_size, args.seed)
+                               "property_window_score": prop,
+                               "property_score": prop,
+                               "total_score": sum(profile["positive_terms"].values())
+                                              + profile["risk_score"] + prop,
+                               "matched_structure_terms": profile["details"],
+                               "functional_family": profile["functional_family"],
+                               "murcko_scaffold": profile["murcko_scaffold"],
+                               "predicted_properties": property_values,
+                               "_profile": profile})
+            if args.guided_selection_strategy == "legacy_topk":
+                for row in scored:
+                    row["fragment_score"] = (
+                        sum(row["_profile"]["positive_terms"].values())
+                        + row["_profile"]["risk_score"])
+                    row.pop("_profile")
+                rows = diverse_top(scored, args.pool_size, args.seed)
+            else:
+                rows = guided_coverage_top(
+                    scored, args.pool_size, args.seed,
+                    args.guided_property_weight, args.guided_fragment_weight,
+                    args.guided_family_coverage_weight,
+                    args.guided_scaffold_coverage_weight,
+                    args.guided_redundancy_weight)
     solvents = [{"name": row["name"], "smiles": row["smiles"], "temperature": 25}
                 for row in rows]
     (output / "solvents.json").write_text(json.dumps(solvents, indent=2) + "\n")
@@ -232,7 +404,25 @@ def main():
     (output / "candidate_pool_metadata.json").write_text(json.dumps({
         "mode": args.mode, "pool_size": args.pool_size,
         "screen_size": args.screen_size if args.mode != "baseline" else None,
+        "candidate_source": args.candidate_source if args.mode != "baseline" else None,
         "seed": args.seed,
+        "guided_selection": ({
+            "strategy": args.guided_selection_strategy,
+            "property_weight": args.guided_property_weight,
+            "fragment_weight": args.guided_fragment_weight,
+            "family_coverage_weight": args.guided_family_coverage_weight,
+            "scaffold_coverage_weight": args.guided_scaffold_coverage_weight,
+            "redundancy_weight": args.guided_redundancy_weight,
+        } if args.mode == "guided" else None),
+        "common_eligibility": {
+            "basic_unique_candidates": len(unique) if args.mode != "baseline" else None,
+            "screened_candidates": len(candidates) if args.mode != "baseline" else None,
+            "eligible_candidates": len(eligible) if args.mode != "baseline" else None,
+            "rejected_before_screen": len(basic_rejected) if args.mode != "baseline" else None,
+            "rejected_after_preflight": len(preflight_rejected) if args.mode != "baseline" else None,
+            "audit_file": "candidate_eligibility_audit.csv" if args.mode != "baseline" else None,
+            "eligible_pool_file": "eligible_pool.csv" if args.mode != "baseline" else None,
+        },
     }, indent=2) + "\n")
 
 

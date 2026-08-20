@@ -2,8 +2,8 @@
 # Run one controlled G0/G1/G2/G3 formula-generation experiment locally.
 #
 # G0: released Bamboo generator checkpoint (no retraining)
-# G1: 62-member random/diverse molecular-pretraining candidate pool
-# G2: 62-member fragment/property soft-constraint candidate pool
+# G1: random 62-member vocabulary drawn from the fixed solvent-like pool
+# G2: soft-constraint 62-member vocabulary drawn from that same pool
 # G3: reuse G2's generator and rank outputs by T-c robustness + explanation
 #     consistency.  G3 deliberately does not retrain a generator.
 
@@ -24,24 +24,37 @@ export PYTHONUNBUFFERED=1
 # same values for a fair comparison.
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-run/generation_experiments}"
 POOL_SIZE="${POOL_SIZE:-62}"
-SCREEN_SIZE="${SCREEN_SIZE:-20000}"
 SYNTHETIC_FORMULAS="${SYNTHETIC_FORMULAS:-30000}"
 SYNTHETIC_OVERSAMPLE_FACTOR="${SYNTHETIC_OVERSAMPLE_FACTOR:-1.5}"
 SYNTHETIC_LABEL_POLICY="${SYNTHETIC_LABEL_POLICY:-strict}"
+# The stratified mode balances *input salt-mixture fractions*.  The frozen
+# oracle remains the source of the actual anion-ratio label, avoiding an
+# unphysical condition/recipe mismatch.
+SYNTHETIC_SALT_MIXTURE_MODE="${SYNTHETIC_SALT_MIXTURE_MODE:-random_1_to_2_salt}"
+SYNTHETIC_SALT_MIXTURE_BINS="${SYNTHETIC_SALT_MIXTURE_BINS:-5}"
+SYNTHETIC_SOLVENT_COUNT_POLICY="${SYNTHETIC_SOLVENT_COUNT_POLICY:-uniform_1_to_3}"
+SYNTHETIC_JOINT_BALANCE_STRATEGY="${SYNTHETIC_JOINT_BALANCE_STRATEGY:-hierarchical_anion_then_conductivity}"
+SYNTHETIC_MIN_NONEMPTY_ANION_BINS="${SYNTHETIC_MIN_NONEMPTY_ANION_BINS:-1}"
 TRAIN_MAX_EPOCH="${TRAIN_MAX_EPOCH:-500}"
 GEN_BATCHES="${GEN_BATCHES:-8}"
 GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-128}"
 SEED="${SEED:-123}"
+# Keep vocabulary selection reproducible without coupling it to diffusion
+# training/sampling randomness.  Set this explicitly for each G1 replicate.
+CANDIDATE_POOL_SEED="${CANDIDATE_POOL_SEED:-$SEED}"
 TARGET_CONDUCTIVITY="${TARGET_CONDUCTIVITY:-20.0}"
 ANION_RATIO="${ANION_RATIO:-0.5}"
 TEMPERATURE_C="${TEMPERATURE_C:-25.0}"
 SALT_MOLAR_RATIO="${SALT_MOLAR_RATIO:-0.10}"
+SELECTION_POLICY="${SELECTION_POLICY:-joint_target}"
+SELECTION_CONDUCTIVITY_TOLERANCE="${SELECTION_CONDUCTIVITY_TOLERANCE:-2.0}"
+SELECTION_ANION_RATIO_TOLERANCE="${SELECTION_ANION_RATIO_TOLERANCE:-0.10}"
+SELECTION_JOINT_ANION_WEIGHT="${SELECTION_JOINT_ANION_WEIGHT:-1.0}"
 
 ORACLE_CONFIG="${ORACLE_CONFIG:-config/test_results/property_fragment_predict.yaml}"
 ORACLE_CKPT="${ORACLE_CKPT:-run/property_fragment_explanation/ckpt_formula_ft}"
 MONO_CONFIG="${MONO_CONFIG:-$ORACLE_CONFIG}"
 MONO_CKPT="${MONO_CKPT:-run/checkpoints/fixed_fragment_mono.pt}"
-MONO_DATA="${MONO_DATA:-/mnt/afs/home/liuwen/git/electrolyte/bamboo_mixer/run/mono_data.json}"
 # The old ele_predictor repository no longer contains emb_dict.  The clean
 # mechanistic repository carries the same 62-solvent/2-salt Bamboo vocabulary
 # and is the correct default for G1/G2 and the G0 vocabulary snapshot.
@@ -53,6 +66,17 @@ BAMBOO_GENERATE_CONFIG="${BAMBOO_GENERATE_CONFIG:-/mnt/afs/home/liuwen/git/elect
 BAMBOO_SOLV_EMBS="${BAMBOO_SOLV_EMBS:-/mnt/afs/home/liuwen/git/electrolyte/bamboo_mixer/run/solv_embs.pt}"
 BAMBOO_SALT_EMBS="${BAMBOO_SALT_EMBS:-/mnt/afs/home/liuwen/git/electrolyte/bamboo_mixer/run/salt_embs.pt}"
 PROPERTY_CONSTRAINTS="${PROPERTY_CONSTRAINTS:-run/property_fragment_attribution_v2/generation_design_constraints/generation_property_constraints.csv}"
+GUIDED_SELECTION_STRATEGY="${GUIDED_SELECTION_STRATEGY:-coverage_v1}"
+GUIDED_PROPERTY_WEIGHT="${GUIDED_PROPERTY_WEIGHT:-1.0}"
+GUIDED_FRAGMENT_WEIGHT="${GUIDED_FRAGMENT_WEIGHT:-1.0}"
+GUIDED_FAMILY_COVERAGE_WEIGHT="${GUIDED_FAMILY_COVERAGE_WEIGHT:-0.7}"
+GUIDED_SCAFFOLD_COVERAGE_WEIGHT="${GUIDED_SCAFFOLD_COVERAGE_WEIGHT:-0.25}"
+GUIDED_REDUNDANCY_WEIGHT="${GUIDED_REDUNDANCY_WEIGHT:-1.0}"
+# Built once by build_solvent_like_pool.py; G1 and G2 must share it.
+SOLVENT_LIKE_POOL="${SOLVENT_LIKE_POOL:-$ROOT/emb_dict/solvent_like_candidates.json}"
+SOLVENT_LIKE_AUDIT="${SOLVENT_LIKE_AUDIT:-$ROOT/emb_dict/solvent_like_candidates_audit.json}"
+# Only controlled ablations with a documented fixed legacy vocabulary may set this.
+ALLOW_FIXED_VOCAB="${ALLOW_FIXED_VOCAB:-0}"
 
 RUN="$EXPERIMENT_ROOT/$GROUP"
 mkdir -p "$RUN"
@@ -108,6 +132,18 @@ need_file "$ORACLE_CONFIG"; need_file "$ORACLE_CKPT/optimal.pt"
 need_file "$ORACLE_CKPT/pretrain.pt"
 need_file "$BAMBOO_SOLVENTS"; need_file "$BAMBOO_SALTS"
 
+verify_existing_pool_source() {
+  local metadata="$1/candidate_pool_metadata.json"
+  if [[ "$ALLOW_FIXED_VOCAB" == "1" ]]; then
+    return
+  fi
+  if [[ ! -f "$metadata" ]] || ! grep -Fq "\"candidate_source\": \"$SOLVENT_LIKE_POOL\"" "$metadata"; then
+    echo "Existing vocabulary in $1 was not built from the configured solvent-like pool." >&2
+    echo "Use a fresh EXPERIMENT_ROOT, or set ALLOW_FIXED_VOCAB=1 only for a documented ablation." >&2
+    exit 1
+  fi
+}
+
 if [[ "$GROUP" == "G0" ]]; then
   # This is intentionally the released Bamboo diffusion/decoder checkpoint.
   # The small candidate-pool file is only a local vocabulary snapshot used by
@@ -159,22 +195,39 @@ elif [[ "$GROUP" == "G3" ]]; then
 else
   POOL="$RUN/candidate_pool"
   if [[ ! -f "$POOL/solvents.json" ]]; then
+    need_file "$SOLVENT_LIKE_POOL"; need_file "$SOLVENT_LIKE_AUDIT"
+    if ! grep -Fq '"screen_name": "solvent_like_v1"' "$SOLVENT_LIKE_AUDIT" \
+       || grep -Eq '"(hbd_max|hba_max|rotatable_bonds_max|tpsa_max|logp)"' "$SOLVENT_LIKE_AUDIT"; then
+      echo "Solvent-like pool audit does not match the current simplified screen: $SOLVENT_LIKE_AUDIT" >&2
+      echo "Expected solvent_like_v1 without HBD/HBA/TPSA/rotatable-bond/logP gates." >&2
+      exit 1
+    fi
     if [[ "$GROUP" == "G1" ]]; then
-      need_file "$MONO_DATA"
+      need_file "$MONO_CKPT"
       run_stage candidate_pool python3 -u scripts/generation/build_candidate_pool.py \
         --mode random --output-dir "$POOL" --baseline-solvents "$BAMBOO_SOLVENTS" \
-        --salts "$BAMBOO_SALTS" --mono-data "$MONO_DATA" --pool-size "$POOL_SIZE" \
-        --screen-size "$SCREEN_SIZE" --seed "$SEED"
+        --salts "$BAMBOO_SALTS" --candidate-source "$SOLVENT_LIKE_POOL" \
+        --pool-size "$POOL_SIZE" --model-config "$MONO_CONFIG" \
+        --mono-checkpoint "$MONO_CKPT" --seed "$CANDIDATE_POOL_SEED"
     else
-      need_file "$MONO_DATA"; need_file "$PROPERTY_CONSTRAINTS"; need_file "$MONO_CKPT"
+      need_file "$PROPERTY_CONSTRAINTS"; need_file "$MONO_CKPT"
       run_stage candidate_pool python3 -u scripts/generation/build_candidate_pool.py \
         --mode guided --output-dir "$POOL" --baseline-solvents "$BAMBOO_SOLVENTS" \
-        --salts "$BAMBOO_SALTS" --mono-data "$MONO_DATA" \
+        --salts "$BAMBOO_SALTS" --candidate-source "$SOLVENT_LIKE_POOL" \
         --property-constraints "$PROPERTY_CONSTRAINTS" --model-config "$MONO_CONFIG" \
         --mono-checkpoint "$MONO_CKPT" --pool-size "$POOL_SIZE" \
-        --screen-size "$SCREEN_SIZE" --seed "$SEED"
+        --seed "$CANDIDATE_POOL_SEED" \
+        --guided-selection-strategy "$GUIDED_SELECTION_STRATEGY" \
+        --guided-property-weight "$GUIDED_PROPERTY_WEIGHT" \
+        --guided-fragment-weight "$GUIDED_FRAGMENT_WEIGHT" \
+        --guided-family-coverage-weight "$GUIDED_FAMILY_COVERAGE_WEIGHT" \
+        --guided-scaffold-coverage-weight "$GUIDED_SCAFFOLD_COVERAGE_WEIGHT" \
+        --guided-redundancy-weight "$GUIDED_REDUNDANCY_WEIGHT"
     fi
-  else record_skip candidate_pool "existing_output"; fi
+  else
+    verify_existing_pool_source "$RUN"
+    record_skip candidate_pool "existing_output"
+  fi
 
   if [[ ! -f "$POOL/solv_embs.pt" ]]; then
     need_file "$MONO_CKPT"
@@ -190,7 +243,13 @@ else
       --output-dir "$RUN/generator_data" --num-formulas "$SYNTHETIC_FORMULAS" \
       --temperature-c "$TEMPERATURE_C" --concentration "$SALT_MOLAR_RATIO" \
       --oversample-factor "$SYNTHETIC_OVERSAMPLE_FACTOR" \
-      --label-policy "$SYNTHETIC_LABEL_POLICY" --seed "$SEED"
+      --label-policy "$SYNTHETIC_LABEL_POLICY" \
+      --solvent-count-policy "$SYNTHETIC_SOLVENT_COUNT_POLICY" \
+      --salt-mixture-mode "$SYNTHETIC_SALT_MIXTURE_MODE" \
+      --salt-mixture-bins "$SYNTHETIC_SALT_MIXTURE_BINS" \
+      --joint-balance-strategy "$SYNTHETIC_JOINT_BALANCE_STRATEGY" \
+      --min-nonempty-anion-bins "$SYNTHETIC_MIN_NONEMPTY_ANION_BINS" \
+      --seed "$SEED"
   else record_skip synthetic_formula_oracle "existing_output"; fi
 
   if [[ ! -f "$RUN/configs/diffusion.yaml" ]]; then
@@ -217,7 +276,11 @@ if [[ ! -f "$RUN/generated/generated_formulas.json" ]]; then
        --oracle-checkpoint "$ORACLE_CKPT" --output "$RUN/generated/generated_formulas.json"
        --target-conductivity "$TARGET_CONDUCTIVITY" --anion-ratio "$ANION_RATIO"
        --temperature-c "$TEMPERATURE_C" --concentration "$SALT_MOLAR_RATIO"
-       --num-batches "$GEN_BATCHES" --batch-size "$GEN_BATCH_SIZE" --seed "$SEED")
+       --num-batches "$GEN_BATCHES" --batch-size "$GEN_BATCH_SIZE" --seed "$SEED"
+       --selection-policy "$SELECTION_POLICY"
+       --conductivity-tolerance "$SELECTION_CONDUCTIVITY_TOLERANCE"
+       --anion-ratio-tolerance "$SELECTION_ANION_RATIO_TOLERANCE"
+       --joint-anion-weight "$SELECTION_JOINT_ANION_WEIGHT")
   if [[ "$GROUP" == "G0" ]]; then
     cmd+=(--decoder-solvent-embeddings "$BAMBOO_SOLV_EMBS"
           --decoder-salt-embeddings "$BAMBOO_SALT_EMBS"

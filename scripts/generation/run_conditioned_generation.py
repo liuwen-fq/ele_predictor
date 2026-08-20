@@ -193,9 +193,24 @@ def main():
     parser.add_argument("--max-conductivity", type=float, default=100.,
                         help="Physical upper guard (mS/cm); larger oracle "
                              "outputs are marked out-of-domain, not ranked.")
+    parser.add_argument("--selection-policy",
+                        choices=("conductivity_max", "joint_target"),
+                        default="conductivity_max",
+                        help="conductivity_max preserves the historical ranking. "
+                        "joint_target ranks by normalized error to both requested "
+                        "conductivity and anion ratio.")
+    parser.add_argument("--conductivity-tolerance", type=float, default=2.0,
+                        help="mS/cm error corresponding to one unit of joint "
+                        "selection loss.")
+    parser.add_argument("--anion-ratio-tolerance", type=float, default=.10,
+                        help="anion-ratio error corresponding to one unit of joint "
+                        "selection loss.")
+    parser.add_argument("--joint-anion-weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--robust", action="store_true")
     args = parser.parse_args()
+    if args.conductivity_tolerance <= 0 or args.anion_ratio_tolerance <= 0:
+        parser.error("joint-selection tolerances must be positive")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     solvents = json.loads(Path(args.solvents).read_text())
     salts = json.loads(Path(args.salts).read_text())
@@ -245,22 +260,28 @@ def main():
         if args.robust:
             trusted = trusted and all(np.isfinite(scores[name][index]) for name in (
                 "robust_min_ms_cm", "robust_mean_ms_cm", "robust_std_ms_cm"))
+        anion_ratio_pred = scores["anion_ratio_pred"][index]
+        finite_anion_ratio = bool(np.isfinite(anion_ratio_pred))
         record = {"bow": row.tolist(), "temperature_c": args.temperature_c,
                   "salt_molar_ratio": args.concentration,
                   "target_conductivity_ms_cm": args.target_conductivity,
                   "anion_ratio_condition": args.anion_ratio,
-                  "anion_ratio_pred": float(scores["anion_ratio_pred"][index]),
+                  "anion_ratio_pred": (float(anion_ratio_pred)
+                                       if finite_anion_ratio else None),
                   "conductivity_pred_ms_cm": float(conductivity) if trusted else None,
                   "prediction_status": "trusted" if trusted else "out_of_domain",
-                  "explanation_residual_25c": scores["explanation_residual_25c"][index]}
+                  "explanation_residual_25c": scores["explanation_residual_25c"][index],
+                  "selection_policy": ("robust_min_conductivity" if args.robust
+                                       else args.selection_policy)}
         for name in ("robust_min_ms_cm", "robust_mean_ms_cm", "robust_std_ms_cm",
                      "explanation_sign_stability"):
             if name in scores:
                 value = scores[name][index]
                 record[name] = float(value) if np.isfinite(value) else None
         # All groups are evaluated with a fixed downstream selection budget.
-        # G0--G2 rank by the frozen-oracle conductivity at the requested
-        # condition.  G3 instead prioritizes the worst point in the 25--55 C,
+        # G0--G2 can retain the historical maximum-conductivity ranking or
+        # rank by distance to the complete requested condition.  G3 instead
+        # prioritizes the worst point in the 25--55 C,
         # 0.05--0.15 concentration grid and uses explanation-sign stability
         # only as a deterministic tie breaker.  This keeps the raw samples
         # unchanged while making the G3 policy explicit and auditable.
@@ -270,6 +291,22 @@ def main():
             record["candidate_rank_score"] = (
                 record["robust_min_ms_cm"]
                 + 1e-3 * record["explanation_sign_stability"])
+        elif args.selection_policy == "joint_target":
+            if not finite_anion_ratio:
+                record["candidate_rank_score"] = None
+            else:
+                conductivity_error = abs(
+                    record["conductivity_pred_ms_cm"] - args.target_conductivity)
+                anion_error = abs(record["anion_ratio_pred"] - args.anion_ratio)
+                record["conductivity_target_abs_error_ms_cm"] = conductivity_error
+                record["anion_ratio_abs_error"] = anion_error
+                # Larger is better for the existing downstream sorter.  The
+                # tolerances state the trade-off in physically interpretable
+                # units, rather than silently letting conductivity dominate.
+                record["candidate_rank_score"] = -(
+                    conductivity_error / args.conductivity_tolerance
+                    + args.joint_anion_weight
+                    * anion_error / args.anion_ratio_tolerance)
         else:
             record["candidate_rank_score"] = record["conductivity_pred_ms_cm"]
         records.append(record)
