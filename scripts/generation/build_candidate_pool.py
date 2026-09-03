@@ -102,8 +102,11 @@ def fragment_profile(smiles):
                 risk_score += weight
     if (mol.HasSubstructMatch(Chem.MolFromSmarts("[OD2]([#6])[#6]"))
             and sum(atom.GetSymbol() == "F" for atom in mol.GetAtoms()) >= 2):
-        details.append("fluorinated_ether_risk")
-        risk_score -= 0.8
+        # The anion-ratio attribution instead finds fluorinated ether motifs
+        # enriched on the higher-ratio side.  They must not receive a blanket
+        # molecular-pool penalty: final formula-level ratio screening decides
+        # whether their amount in a mixture remains in the safe window.
+        details.append("fluorinated_ether_contextual")
     if any(bond.IsInRing() for bond in mol.GetBonds()) and "ester" in details:
         details.append("lactone_bonus")
         positive_terms["lactone_bonus"] = 0.8
@@ -115,6 +118,23 @@ def fragment_profile(smiles):
     if not family_tags:
         family_tags = ["other"]
     scaffold = MurckoScaffold.MurckoScaffoldSmiles(mol=mol) or "acyclic"
+    # These terms are deliberately only a *G2 tie breaker*.  Anion ratio is a
+    # formula-level transport property, so no individual solvent is declared
+    # to be inside/outside the 0.12--0.68 target window here.  The signs are
+    # taken from the detailed anion attribution: nitrile, ether, carbonate and
+    # fluorinated-carbon motifs tend to raise the anion-ratio explanation,
+    # while ester/lactone-rich motifs tend to lower it.  Exact formula-level
+    # screening is performed by build_synthetic_generator_data.py.
+    anion_terms = {
+        "nitrile": 0.75 if mol.HasSubstructMatch(Chem.MolFromSmarts("[C]#[N]")) else 0.0,
+        "ether": 0.20 if mol.HasSubstructMatch(Chem.MolFromSmarts("[OD2]([#6])[#6]")) else 0.0,
+        "carbonate": 0.35 if mol.HasSubstructMatch(Chem.MolFromSmarts("[OD2][CX3](=O)[OD2]")) else 0.0,
+        "fluorinated_carbon": 0.12 if sum(atom.GetSymbol() == "F" for atom in mol.GetAtoms()) >= 2 else 0.0,
+        "ester": -0.30 if mol.HasSubstructMatch(Chem.MolFromSmarts("[CX3](=O)[OX2]")) else 0.0,
+    }
+    if any(bond.IsInRing() for bond in mol.GetBonds()) and anion_terms["ester"]:
+        anion_terms["lactone"] = -0.20
+    anion_terms = {name: value for name, value in anion_terms.items() if value}
     return {
         "positive_terms": positive_terms,
         "risk_score": risk_score,
@@ -123,6 +143,8 @@ def fragment_profile(smiles):
         "murcko_scaffold": scaffold,
         "fingerprint": AllChem.GetMorganFingerprintAsBitVect(
             mol, radius=2, nBits=2048),
+        "anion_terms": anion_terms,
+        "anion_tendency_score": sum(anion_terms.values()),
     }
 
 
@@ -185,7 +207,8 @@ def concave_marginal(count, amount=1):
 
 def guided_coverage_top(rows, pool_size, seed, property_weight,
                         fragment_weight, family_coverage_weight,
-                        scaffold_coverage_weight, redundancy_weight):
+                        scaffold_coverage_weight, redundancy_weight,
+                        anion_guided_weight):
     """Greedily select explanation-guided molecules by current marginal gain.
 
     No fragment has a hard occurrence limit.  Its gain follows ``log(1+n)``:
@@ -198,6 +221,7 @@ def guided_coverage_top(rows, pool_size, seed, property_weight,
     remaining = [dict(row, _tie_break=rng.random()) for row in rows]
     selected, fingerprints = [], []
     term_counts, family_counts, scaffold_counts = Counter(), Counter(), Counter()
+    anion_tendency_sum = 0.0
     while len(selected) < pool_size:
         best, best_terms = None, None
         for row in remaining:
@@ -214,23 +238,37 @@ def guided_coverage_top(rows, pool_size, seed, property_weight,
                 scaffold_gain = scaffold_coverage_weight * concave_marginal(
                     scaffold_counts[profile["murcko_scaffold"]])
             redundancy_penalty = redundancy_weight * max_similarity
+            # Anion ratio is a formula-level property.  Do not reward a
+            # direction (which would make G2 drift toward very high ratios);
+            # instead softly discourage a vocabulary whose *aggregate*
+            # attribution tendencies are one-sided.  This is symmetric: a
+            # large negative trend is penalized just as a large positive one.
+            next_anion_mean = (anion_tendency_sum + profile["anion_tendency_score"]) / (len(selected) + 1)
+            anion_balance_penalty = anion_guided_weight * abs(next_anion_mean)
             marginal = (
                 property_weight * row["property_window_score"]
                 + fragment_weight * fragment_gain
                 + profile["risk_score"]
-                + family_gain + scaffold_gain - redundancy_penalty)
+                + family_gain + scaffold_gain - redundancy_penalty
+                - anion_balance_penalty)
             key = (marginal, -row["_tie_break"])
             if best is None or key > best[0]:
                 best = (key, row, max_similarity, fragment_gain, family_gain,
-                        scaffold_gain, redundancy_penalty, marginal)
+                        scaffold_gain, redundancy_penalty, anion_balance_penalty,
+                        next_anion_mean, marginal)
                 best_terms = profile["positive_terms"]
-        _, row, max_similarity, fragment_gain, family_gain, scaffold_gain, penalty, marginal = best
+        (_, row, max_similarity, fragment_gain, family_gain, scaffold_gain,
+         penalty, anion_balance_penalty, next_anion_mean, marginal) = best
         profile = row.pop("_profile")
         row.pop("_tie_break")
         row.update({
             "selection": "guided_coverage_v1",
             "fragment_score": sum(profile["positive_terms"].values()) + profile["risk_score"],
             "fragment_risk_score": profile["risk_score"],
+            "anion_tendency_score": profile["anion_tendency_score"],
+            "anion_matched_terms": ";".join(sorted(profile["anion_terms"])) or "none",
+            "anion_balance_penalty": anion_balance_penalty,
+            "selected_anion_tendency_mean": next_anion_mean,
             "selected_fragment_marginal": fragment_gain,
             "family_coverage_gain": family_gain,
             "scaffold_coverage_gain": scaffold_gain,
@@ -250,6 +288,7 @@ def guided_coverage_top(rows, pool_size, seed, property_weight,
             scaffold_counts[profile["murcko_scaffold"]] += 1
         for term in best_terms:
             term_counts[term] += 1
+        anion_tendency_sum += profile["anion_tendency_score"]
         remaining.remove(row)
     return selected
 
@@ -294,6 +333,10 @@ def main():
     parser.add_argument("--guided-family-coverage-weight", type=float, default=0.7)
     parser.add_argument("--guided-scaffold-coverage-weight", type=float, default=0.25)
     parser.add_argument("--guided-redundancy-weight", type=float, default=1.0)
+    parser.add_argument("--anion-guided-weight", type=float, default=0.0,
+                        help="G2-only symmetric penalty for a vocabulary with "
+                        "one-sided anion-ratio motif tendencies; it is not a "
+                        "single-molecule ratio predictor or hard filter.")
     parser.add_argument("--model-config")
     parser.add_argument("--mono-checkpoint")
     parser.add_argument("--pool-size", type=int, default=62)
@@ -378,6 +421,8 @@ def main():
                                "total_score": sum(profile["positive_terms"].values())
                                               + profile["risk_score"] + prop,
                                "matched_structure_terms": profile["details"],
+                               "anion_tendency_score": profile["anion_tendency_score"],
+                               "anion_matched_terms": ";".join(sorted(profile["anion_terms"])) or "none",
                                "functional_family": profile["functional_family"],
                                "murcko_scaffold": profile["murcko_scaffold"],
                                "predicted_properties": property_values,
@@ -395,7 +440,8 @@ def main():
                     args.guided_property_weight, args.guided_fragment_weight,
                     args.guided_family_coverage_weight,
                     args.guided_scaffold_coverage_weight,
-                    args.guided_redundancy_weight)
+                    args.guided_redundancy_weight,
+                    args.anion_guided_weight)
     solvents = [{"name": row["name"], "smiles": row["smiles"], "temperature": 25}
                 for row in rows]
     (output / "solvents.json").write_text(json.dumps(solvents, indent=2) + "\n")
@@ -413,6 +459,7 @@ def main():
             "family_coverage_weight": args.guided_family_coverage_weight,
             "scaffold_coverage_weight": args.guided_scaffold_coverage_weight,
             "redundancy_weight": args.guided_redundancy_weight,
+            "anion_guided_weight": args.anion_guided_weight,
         } if args.mode == "guided" else None),
         "common_eligibility": {
             "basic_unique_candidates": len(unique) if args.mode != "baseline" else None,

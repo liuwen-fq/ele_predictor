@@ -24,7 +24,30 @@ from .match_and_map import (add_atom_map_num, clear_atom_map_num,
                             find_mapped_smarts_matches, get_smiles,
                             is_atom_map_num_valid,
                             renumber_atoms_with_atom_map_num)
-from .plot import plot_molecule_torsion, show_mol, show_mol_grid, show_smarts
+# RDKit's drawing backend can require optional X11 shared libraries such as
+# libXrender.  Molecule construction, screening and model training never draw
+# molecules, so importing them must remain usable on headless GPU workers.
+# Keep the public plotting API, but load it only when a caller explicitly
+# requests an image.
+def _plot_function(name):
+    from . import plot
+    return getattr(plot, name)
+
+
+def plot_molecule_torsion(*args, **kwargs):
+    return _plot_function("plot_molecule_torsion")(*args, **kwargs)
+
+
+def show_mol(*args, **kwargs):
+    return _plot_function("show_mol")(*args, **kwargs)
+
+
+def show_mol_grid(*args, **kwargs):
+    return _plot_function("show_mol_grid")(*args, **kwargs)
+
+
+def show_smarts(*args, **kwargs):
+    return _plot_function("show_smarts")(*args, **kwargs)
 from .resonance import get_canonical_resoner, get_resonance_structures
 from .sanitize import (apply_inplace_reaction, cleanup_rkmol_isotope,
                        cleanup_rkmol_stereochemistry, get_mol_from_smiles,

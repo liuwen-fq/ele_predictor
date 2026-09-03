@@ -418,10 +418,20 @@ class MolMix(torch.nn.Module):
                     "tasks"]["conductivity_mistry"]["residual"].unsqueeze(-1)
             result["conductivity"] = conductivity
             if fragment_explanations is not None:
-                explain_task = fragment_explanations["tasks"][
-                    "conductivity_explain"]
-                result["conductivity_explain"] = explain_task[
-                    "explanation_prediction"].unsqueeze(-1)
-                result["conductivity_explain_reference"] = explain_task[
-                    "condition_reference"].unsqueeze(-1)
+                explain_tasks = fragment_explanations["tasks"]
+                if "conductivity_explain" in explain_tasks:
+                    explain_task = explain_tasks["conductivity_explain"]
+                    result["conductivity_explain"] = explain_task[
+                        "explanation_prediction"].unsqueeze(-1)
+                    result["conductivity_explain_reference"] = explain_task[
+                        "condition_reference"].unsqueeze(-1)
+                if "anion_ratio_explain" in explain_tasks:
+                    anion_explain_task = explain_tasks["anion_ratio_explain"]
+                    result["anion_ratio_explain"] = anion_explain_task[
+                        "explanation_prediction"].unsqueeze(-1)
+                    # The additive constituents live in logit space; exposing
+                    # it makes the salt baseline/property/fragment split
+                    # interpretable without letting their sum leave [0, 1].
+                    result["anion_ratio_explain_logit"] = anion_explain_task[
+                        "explanation_logit"].unsqueeze(-1)
         return result

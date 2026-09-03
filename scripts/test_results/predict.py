@@ -92,6 +92,8 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
     contribution_data = diagnostics[diagnostic_key]
     task_data = contribution_data["tasks"][task]
     main_effects = task_data["main_effect"].detach().cpu().tolist()
+    anion_task = task == "anion_ratio_explain"
+    effect_prefix = "anion_ratio" if anion_task else "conductivity"
     fragment_lookup = {}
     offset = 0
     for formula_index, formula in enumerate(annotated_metadata):
@@ -100,10 +102,14 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
                 if offset >= len(main_effects):
                     raise ValueError(
                         "fragment contribution is shorter than metadata")
-                fragment["conductivity_main_effect_normalized"] = float(
-                    main_effects[offset])
-                fragment["conductivity_main_effect_delta_ln"] = float(
-                    main_effects[offset] * LOG_CONDUCTIVITY_SCALE)
+                if anion_task:
+                    fragment[f"{effect_prefix}_main_effect_logit"] = float(
+                        main_effects[offset])
+                else:
+                    fragment["conductivity_main_effect_normalized"] = float(
+                        main_effects[offset])
+                    fragment["conductivity_main_effect_delta_ln"] = float(
+                        main_effects[offset] * LOG_CONDUCTIVITY_SCALE)
                 fragment_lookup[offset] = (
                     formula_index,
                     molecule_index,
@@ -165,13 +171,14 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
         },
         "total_composition_offset_normalized": float(property_sum + residual),
         "explanation_prediction_normalized": float(explanation),
-        "total_residual_delta_ln": float(
-            residual * LOG_CONDUCTIVITY_SCALE),
-        "fragment_conductivity_multiplier": float(math.exp(
-            max(-50.0, min(50.0, residual * LOG_CONDUCTIVITY_SCALE)))),
-        "conductivity_multiplier": float(math.exp(max(
+        "explanation_logit": float(explanation) if anion_task else None,
+        "total_residual_delta_ln": (None if anion_task else float(
+            residual * LOG_CONDUCTIVITY_SCALE)),
+        "fragment_conductivity_multiplier": (None if anion_task else float(math.exp(
+            max(-50.0, min(50.0, residual * LOG_CONDUCTIVITY_SCALE))))),
+        "conductivity_multiplier": (None if anion_task else float(math.exp(max(
             -50.0,
-            min(50.0, (property_sum + residual) * LOG_CONDUCTIVITY_SCALE)))),
+            min(50.0, (property_sum + residual) * LOG_CONDUCTIVITY_SCALE))))),
         "top_fragment_pairs": [],
     } for (raw_main, raw_interaction, raw_residual, value, interaction,
            residual, scale, bound, reference, property_sum, by_name,
@@ -204,9 +211,8 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
         right_info = fragment_lookup[int(right)]
         if left_info[0] != formula_index or right_info[0] != formula_index:
             raise ValueError("pair contribution formula assignment mismatch")
-        output[formula_index]["top_fragment_pairs"].append({
-            "effect_normalized": float(effect),
-            "effect_delta_ln": float(effect * LOG_CONDUCTIVITY_SCALE),
+        pair_record = {
+            "effect_logit": float(effect),
             "left": {
                 "molecule_index": left_info[1],
                 "molecule_name": left_info[3],
@@ -219,7 +225,11 @@ def collect_fragment_contributions(component_graph, annotated_metadata,
                 "fragment_id": right_info[2],
                 "fragment_smiles": right_info[4],
             },
-        })
+        }
+        if not anion_task:
+            pair_record["effect_delta_ln"] = float(
+                effect * LOG_CONDUCTIVITY_SCALE)
+        output[formula_index]["top_fragment_pairs"].append(pair_record)
     return output
 
 
@@ -417,6 +427,7 @@ def main():
     conductivities_base_pred = []
     conductivities_explain_pred = []
     anion_ratios_pred = []
+    anion_ratios_explain_pred = []
     n1s = []
     n2s = []
     T0s = []
@@ -428,6 +439,8 @@ def main():
     fragment_contributions = []
     fragment_explanations = []
     property_explanations = []
+    anion_fragment_explanations = []
+    anion_property_explanations = []
     molecular_property_profiles = []
     fragment_gates = None
 
@@ -470,6 +483,9 @@ def main():
             pred_explain_conductivities = torch.exp(
                 pred["conductivity_explain"].squeeze(-1) * 8.3344 - 4.6002)
         pred_anion_ratios = pred["anion_ratio"].squeeze(-1)
+        pred_anion_ratios_explain = pred.get("anion_ratio_explain")
+        if pred_anion_ratios_explain is not None:
+            pred_anion_ratios_explain = pred_anion_ratios_explain.squeeze(-1)
 
         fragment_diagnostics = pred["fragment_diagnostics"]
         fragment_gates = collect_fragment_gates(fragment_diagnostics)
@@ -486,6 +502,10 @@ def main():
             property_explanations.extend(
                 [None] * pred_conductivities.shape[0])
             molecular_property_profiles.extend(
+                [None] * pred_conductivities.shape[0])
+            anion_fragment_explanations.extend(
+                [None] * pred_conductivities.shape[0])
+            anion_property_explanations.extend(
                 [None] * pred_conductivities.shape[0])
         else:
             batch_contributions = collect_fragment_contributions(
@@ -534,6 +554,22 @@ def main():
                     [None] * pred_conductivities.shape[0])
             else:
                 molecular_property_profiles.extend(batch_property_profiles)
+            if pred_anion_ratios_explain is None:
+                anion_fragment_explanations.extend(
+                    [None] * pred_conductivities.shape[0])
+                anion_property_explanations.extend(
+                    [None] * pred_conductivities.shape[0])
+            else:
+                anion_fragment_explanations.extend(
+                    collect_fragment_contributions(
+                        graph.solv_graphs, solvents_attention,
+                        fragment_diagnostics, task="anion_ratio_explain",
+                        diagnostic_key="explanations"))
+                anion_property_explanations.extend(
+                    collect_property_explanations(
+                        solvents_attention, fragment_diagnostics,
+                        graph.solv_graphs.molar_ratios,
+                        task="anion_ratio_explain"))
 
         for c in pred_conductivities:
             conductivities_pred.append(c.item())
@@ -545,6 +581,9 @@ def main():
 
         for a in pred_anion_ratios:
             anion_ratios_pred.append(a.item())
+        if pred_anion_ratios_explain is not None:
+            for a in pred_anion_ratios_explain:
+                anion_ratios_explain_pred.append(a.item())
 
         for sigma0 in batch_outputs["layer_outputs"]["readout_pred.sigma"]:
             if isinstance(sigma0, (float, int)):
@@ -593,6 +632,8 @@ def main():
         if conductivities_explain_pred:
             entry["conductivity_explain_pred"] = conductivities_explain_pred[i]
         entry["anion_ratio_pred"] = anion_ratios_pred[i]
+        if anion_ratios_explain_pred:
+            entry["anion_ratio_explain_pred"] = anion_ratios_explain_pred[i]
         entry["sigma0"] = sigma0s[i]
         entry["n1"] = n1s[i]
         entry["n2"] = n2s[i]
@@ -612,6 +653,10 @@ def main():
             entry["property_explanations"] = property_explanations[i]
         if molecular_property_profiles[i] is not None:
             entry["molecular_property_profiles"] = molecular_property_profiles[i]
+        if anion_fragment_explanations[i] is not None:
+            entry["anion_ratio_fragment_explanations"] = anion_fragment_explanations[i]
+        if anion_property_explanations[i] is not None:
+            entry["anion_ratio_property_explanations"] = anion_property_explanations[i]
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 

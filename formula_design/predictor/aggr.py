@@ -660,6 +660,7 @@ class ConditionAwarePropertyFragmentExplainer(
                  property_scales=None,
                  property_effect_scale: float = 0.10,
                  property_bound: float = 0.25,
+                 task_output_activations=None,
                  **kwargs):
         self.property_names = tuple(property_names)
         if not self.property_names:
@@ -681,6 +682,17 @@ class ConditionAwarePropertyFragmentExplainer(
         self.property_effect_scale = float(property_effect_scale)
         self.property_bound = float(property_bound)
         super().__init__(*args, **kwargs)
+        activations = dict(task_output_activations or {})
+        unsupported = set(activations).difference(self.task_names)
+        if unsupported:
+            raise ValueError(
+                f"task_output_activations contains unknown tasks: {unsupported}")
+        self.task_output_activations = {
+            task: activations.get(task, "identity") for task in self.task_names
+        }
+        if any(activation not in {"identity", "sigmoid"}
+               for activation in self.task_output_activations.values()):
+            raise ValueError("task output activation must be identity or sigmoid")
         self.register_buffer("property_centers",
                              torch.tensor(centers, dtype=torch.float32))
         self.register_buffer("property_scales",
@@ -784,9 +796,15 @@ class ConditionAwarePropertyFragmentExplainer(
             task_output = output["tasks"][task]
             property_output = property_outputs[task]
             task_output.update(property_output)
-            task_output["explanation_prediction"] = (
+            explanation_logit = (
                 task_output["condition_reference"]
                 + property_output["property_sum"]
                 + task_output["residual"])
+            task_output["explanation_logit"] = explanation_logit
+            if self.task_output_activations[task] == "sigmoid":
+                task_output["explanation_prediction"] = torch.sigmoid(
+                    explanation_logit)
+            else:
+                task_output["explanation_prediction"] = explanation_logit
         output["property_molecule_formula_index"] = molecule_formula
         return output

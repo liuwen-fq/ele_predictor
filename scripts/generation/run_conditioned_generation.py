@@ -46,6 +46,51 @@ def load_generator(config_path, checkpoint, model_cls, model_key):
     return model.eval().to("cuda")
 
 
+def load_mechanism_prior(path):
+    """Load the empirical p(I_sigma, I_r | sigma, r) sampling table.
+
+    The table is constructed from the training synthetic set before a possible
+    M-shuffle perturbation.  It provides a requested-condition mechanism
+    sample at generation time; it never evaluates the mechanism of an unknown
+    decoded formula, which would be circular.
+    """
+    # This file is written locally by prepare_mechanism_conditioned_data.py,
+    # and contains tensors rather than a model checkpoint.
+    prior = torch.load(path, weights_only=False, map_location="cpu")
+    required = {"conditions", "condition_std", "mechanism_emb_zscore"}
+    missing = required.difference(prior)
+    if missing:
+        raise RuntimeError(
+            f"mechanism prior {path} misses required keys: {sorted(missing)}")
+    conditions = torch.as_tensor(prior["conditions"], dtype=torch.float32)
+    mechanism = torch.as_tensor(prior["mechanism_emb_zscore"], dtype=torch.float32)
+    condition_std = torch.as_tensor(prior["condition_std"], dtype=torch.float32)
+    if (conditions.ndim != 2 or conditions.shape[1] != 2
+            or mechanism.shape != (conditions.shape[0], 2)
+            or condition_std.shape != (2,) or torch.any(condition_std <= 0)):
+        raise RuntimeError(
+            "invalid mechanism prior shapes; expected conditions [N,2], "
+            "mechanism_emb_zscore [N,2], condition_std [2]")
+    if not torch.isfinite(conditions).all() or not torch.isfinite(mechanism).all():
+        raise RuntimeError("mechanism prior contains non-finite values")
+    return {"conditions": conditions, "condition_std": condition_std,
+            "mechanism_emb_zscore": mechanism}
+
+
+def sample_empirical_mechanism(prior, target_condition, batch_size, neighbors):
+    """Sample a local empirical mechanism prior around one requested condition."""
+    if neighbors < 1:
+        raise ValueError("mechanism-prior-neighbors must be positive")
+    target = target_condition.detach().cpu().reshape(1, 2)
+    normalized_delta = ((prior["conditions"] - target)
+                        / prior["condition_std"].reshape(1, 2))
+    distance_sq = (normalized_delta ** 2).sum(dim=1)
+    count = min(int(neighbors), distance_sq.numel())
+    neighbor_indices = torch.topk(distance_sq, k=count, largest=False).indices
+    draw = torch.randint(count, (batch_size,))
+    return prior["mechanism_emb_zscore"][neighbor_indices[draw]]
+
+
 def load_released_bamboo_generators(config_path, diffusion_checkpoint,
                                     decoder_checkpoint, bamboo_root,
                                     solvent_embeddings=None,
@@ -176,6 +221,13 @@ def main():
     parser.add_argument("--decoder-checkpoint", required=True)
     parser.add_argument("--decoder-solvent-embeddings")
     parser.add_argument("--decoder-salt-embeddings")
+    parser.add_argument(
+        "--mechanism-prior",
+        help="mechanism_prior.pt for a 4-D mechanism-conditioned diffusion model")
+    parser.add_argument(
+        "--mechanism-prior-neighbors", type=int, default=256,
+        help="number of nearest synthetic condition labels used by the "
+             "empirical p(I_sigma, I_r | sigma, r) sampler")
     parser.add_argument("--released-bamboo-root",
                         help="Bamboo repository root; enables the original "
                              "released G0 generator implementation.")
@@ -186,6 +238,10 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--target-conductivity", type=float, default=20.)
     parser.add_argument("--anion-ratio", type=float, default=.5)
+    parser.add_argument("--anion-ratio-min", type=float, default=0.0,
+                        help="inclusive predicted anion-ratio eligibility lower bound")
+    parser.add_argument("--anion-ratio-max", type=float, default=1.0,
+                        help="inclusive predicted anion-ratio eligibility upper bound")
     parser.add_argument("--temperature-c", type=float, default=25.)
     parser.add_argument("--concentration", type=float, default=.1)
     parser.add_argument("--num-batches", type=int, default=8)
@@ -211,6 +267,10 @@ def main():
     args = parser.parse_args()
     if args.conductivity_tolerance <= 0 or args.anion_ratio_tolerance <= 0:
         parser.error("joint-selection tolerances must be positive")
+    if not (0.0 <= args.anion_ratio_min < args.anion_ratio_max <= 1.0):
+        parser.error("require 0 <= --anion-ratio-min < --anion-ratio-max <= 1")
+    if not args.anion_ratio_min <= args.anion_ratio <= args.anion_ratio_max:
+        parser.error("--anion-ratio condition must be inside the eligibility window")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     solvents = json.loads(Path(args.solvents).read_text())
     salts = json.loads(Path(args.salts).read_text())
@@ -237,16 +297,39 @@ def main():
         decoder = FormulaDecoder(**decoder_model_config)
         decoder.load_ckpt(args.decoder_checkpoint)
         decoder.eval().to("cuda")
-    condition = torch.tensor(
+    property_condition = torch.tensor(
         [(np.log(args.target_conductivity) + 4.6002) / 8.3344,
          args.anion_ratio],
         dtype=torch.float32,
         device="cuda",
-    ).repeat(args.batch_size, 1)
+    )
+    if diffusion.prop_dim == 4:
+        if not args.mechanism_prior:
+            parser.error(
+                "this diffusion checkpoint has prop_dim=4; provide "
+                "--mechanism-prior generated from its training synthetic set")
+        mechanism_prior = load_mechanism_prior(args.mechanism_prior)
+    elif diffusion.prop_dim == 2:
+        if args.mechanism_prior:
+            parser.error(
+                "--mechanism-prior was supplied to a 2-D diffusion checkpoint")
+        mechanism_prior = None
+    else:
+        raise RuntimeError(f"unsupported diffusion prop_dim={diffusion.prop_dim}")
     embeddings = []
+    sampled_mechanisms = []
     with torch.no_grad():
         for index in range(args.num_batches):
             torch.manual_seed(args.seed + index)
+            if mechanism_prior is None:
+                condition = property_condition.repeat(args.batch_size, 1)
+            else:
+                mechanism = sample_empirical_mechanism(
+                    mechanism_prior, property_condition, args.batch_size,
+                    args.mechanism_prior_neighbors).to("cuda")
+                condition = torch.cat((
+                    property_condition.repeat(args.batch_size, 1), mechanism), dim=1)
+                sampled_mechanisms.extend(mechanism.detach().cpu().tolist())
             embeddings.append(diffusion.sample(condition)[0]["frm_emb"])
         bow = decoder.predict(torch.cat(embeddings, dim=0).reshape(-1, 384))["bow_vec"]
     bow = normalize_bow(bow.detach().cpu(), len(solvents))
@@ -262,22 +345,45 @@ def main():
                 "robust_min_ms_cm", "robust_mean_ms_cm", "robust_std_ms_cm"))
         anion_ratio_pred = scores["anion_ratio_pred"][index]
         finite_anion_ratio = bool(np.isfinite(anion_ratio_pred))
+        within_anion_window = (finite_anion_ratio and args.anion_ratio_min
+                               <= anion_ratio_pred <= args.anion_ratio_max)
+        oracle_valid = bool(np.isfinite(conductivity))
+        # A numerically valid conductivity alone is not sufficient for a
+        # trusted design candidate: the jointly requested transport window
+        # must hold for the same decoded formula.
+        trusted = trusted and within_anion_window
         record = {"bow": row.tolist(), "temperature_c": args.temperature_c,
                   "salt_molar_ratio": args.concentration,
                   "target_conductivity_ms_cm": args.target_conductivity,
                   "anion_ratio_condition": args.anion_ratio,
                   "anion_ratio_pred": (float(anion_ratio_pred)
                                        if finite_anion_ratio else None),
+                  "anion_ratio_eligibility_min": args.anion_ratio_min,
+                  "anion_ratio_eligibility_max": args.anion_ratio_max,
+                  "within_anion_ratio_eligibility": bool(within_anion_window),
+                  "oracle_conductivity_pred_ms_cm": (float(conductivity)
+                                                      if oracle_valid else None),
                   "conductivity_pred_ms_cm": float(conductivity) if trusted else None,
                   "prediction_status": "trusted" if trusted else "out_of_domain",
                   "explanation_residual_25c": scores["explanation_residual_25c"][index],
                   "selection_policy": ("robust_min_conductivity" if args.robust
                                        else args.selection_policy)}
+        if sampled_mechanisms:
+            record["sampled_mechanism_condition_zscore"] = [
+                float(value) for value in sampled_mechanisms[index]]
         for name in ("robust_min_ms_cm", "robust_mean_ms_cm", "robust_std_ms_cm",
                      "explanation_sign_stability"):
             if name in scores:
                 value = scores[name][index]
                 record[name] = float(value) if np.isfinite(value) else None
+        if not finite_anion_ratio:
+            record["eligibility_reason"] = "nonfinite_anion_ratio"
+        elif not within_anion_window:
+            record["eligibility_reason"] = "anion_ratio_outside_window"
+        elif not oracle_valid:
+            record["eligibility_reason"] = "conductivity_out_of_domain"
+        else:
+            record["eligibility_reason"] = ""
         # All groups are evaluated with a fixed downstream selection budget.
         # G0--G2 can retain the historical maximum-conductivity ranking or
         # rank by distance to the complete requested condition.  G3 instead

@@ -59,6 +59,9 @@ class LossType(Enum):
     conductivity_explain_MAE = 30
     conductivity_explain_fidelity_MAE = 31
     property_effect_L1 = 32
+    anion_ratio_explain_MAE = 33
+    anion_ratio_explain_fidelity_MAE = 34
+    mechanism_aux_Huber = 35
 
 
 def loss_func(preds: dict, data: MixData, loss_type: LossType, **kwargs):
@@ -294,6 +297,37 @@ def loss_func(preds: dict, data: MixData, loss_type: LossType, **kwargs):
         else:
             loss = torch.mean(loss)
 
+    elif loss_type is LossType.anion_ratio_explain_MAE:
+
+        label = data.anion_ratio
+        loss = torch.abs(preds["anion_ratio_explain"].squeeze() - label)
+        if hasattr(data, 'anion_ratio_mask'):
+            loss = loss * data.anion_ratio_mask.squeeze()
+            num_data = torch.sum(data.anion_ratio_mask.squeeze())
+            loss = loss.sum()
+            if num_data == 0:
+                loss *= 0
+            else:
+                loss /= num_data
+        else:
+            loss = torch.mean(loss)
+
+    elif loss_type is LossType.anion_ratio_explain_fidelity_MAE:
+
+        loss = torch.abs(
+            preds["anion_ratio_explain"].squeeze()
+            - preds["anion_ratio"].detach().squeeze())
+        if hasattr(data, 'anion_ratio_mask'):
+            loss = loss * data.anion_ratio_mask.squeeze()
+            num_data = torch.sum(data.anion_ratio_mask.squeeze())
+            loss = loss.sum()
+            if num_data == 0:
+                loss *= 0
+            else:
+                loss /= num_data
+        else:
+            loss = torch.mean(loss)
+
     elif loss_type is LossType.emb_inv_MSE:
 
         label = data.frm_emb
@@ -353,6 +387,42 @@ def loss_func(preds: dict, data: MixData, loss_type: LossType, **kwargs):
 
     elif loss_type is LossType.diff_MSE:
         loss = F.mse_loss(preds["pred_e"].squeeze(), preds["rand_e"].squeeze())
+
+    elif loss_type is LossType.mechanism_aux_Huber:
+        if "mechanism_aux_pred" not in preds:
+            raise ValueError(
+                "mechanism_aux_Huber requires a diffusion model with "
+                "mechanism_auxiliary.enabled=true")
+        if not hasattr(data, "mechanism_aux_emb"):
+            raise ValueError(
+                "mechanism_aux_Huber requires data.mechanism_aux_emb "
+                "with shape [batch, mechanism_label_dim]")
+        prediction = preds["mechanism_aux_pred"]
+        label = data.mechanism_aux_emb
+        if prediction.shape != label.shape:
+            raise ValueError(
+                "mechanism auxiliary prediction/label shape mismatch: "
+                f"{tuple(prediction.shape)} vs {tuple(label.shape)}")
+        # Huber is preferable to MSE here because explanation interaction
+        # residuals can contain rare but legitimate large fragment-pair
+        # effects.  Normalizing by the active confidence weights preserves a
+        # stable loss magnitude even when a batch samples mostly high-noise
+        # diffusion steps.
+        per_feature = F.smooth_l1_loss(prediction, label, reduction="none")
+        per_sample = per_feature.mean(dim=-1)
+        if kwargs.get("snr_weighted", False):
+            weights = preds.get("mechanism_aux_snr_weight")
+            if weights is None:
+                raise ValueError(
+                    "snr_weighted mechanism_aux_Huber requires "
+                    "mechanism_aux_snr_weight from FormulaDiffusion")
+            if weights.shape != per_sample.shape:
+                raise ValueError(
+                    "mechanism auxiliary SNR weight shape mismatch: "
+                    f"{tuple(weights.shape)} vs {tuple(per_sample.shape)}")
+            loss = torch.sum(per_sample * weights) / weights.sum().clamp_min(1e-8)
+        else:
+            loss = torch.mean(per_sample)
 
     elif loss_type in {
             LossType.fragment_main_L1,

@@ -103,6 +103,37 @@ joint_hit          = conductivity_error <= Delta_sigma
 - Pareto 前沿（高电导率、低偏差、低黏度/高稳定性）；
 - 温度—浓度鲁棒性。
 
+## 已实现：受门控的 logit-space anion 解释头
+
+实现入口为：
+
+```bash
+bash submit/run_anion_ratio_explanation_pipeline.sh all
+```
+
+新增头与普通 `readout_anion_ratio` 并行，且不回写主预测路径。其形式为：
+
+```text
+logit(r_explain)
+= salt/concentration/temperature reference
++ solvent-property contribution
++ solvent-fragment main contribution
++ cross-molecule fragment interaction
+
+r_explain = sigmoid(logit(r_explain))
+```
+
+其中盐、浓度和温度先进入一个**配方级条件基线**；当前版本不把该基线再拆分成逐盐片段归因，以免在缺乏独立盐标注时制造不稳定的“盐片段因果解释”。溶剂片段、`dc/vis/Tm` 性质项和跨分子片段交互则单独输出，所有 anion 贡献单位为 logit，不应误读为直接的 ratio 增量。
+
+pipeline 输出：
+
+- `results/ft_test_predictions.json`：普通/解释 anion ratio，以及普通/解释 conductivity 预测；
+- `results/anion_ratio_explain_metrics.json`：普通 head 与解释头的 MAE、RMSE、R² 和 MAE 差；
+- `results/conductivity_metrics.json`、`conductivity_explain_metrics.json`：电导率预测情况；
+- `analysis/`：仅在 `MAE(explain) <= MAE(ordinary) + 0.01` 时写出 anion 片段、溶剂性质和交互贡献。若不达标，分析被主动拒绝，避免用不忠实的解释约束 G2。
+
+该验收门槛只决定是否发布归因；它不代表生成器的 anion-ratio 条件支持已经充分。生成训练数据覆盖仍须作为 G1/G2 共同处理步骤。
+
 ## 推荐实施顺序
 
 1. 用当前联合条件数据重训 G1/G2 diffusion 与 decoder；G3复用新的 G2 generator。

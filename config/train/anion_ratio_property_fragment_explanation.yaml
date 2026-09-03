@@ -1,0 +1,107 @@
+meta:
+  work_folder: "run/anion_ratio_property_fragment_explanation/ckpt_formula_ft"
+  random_seed: 123
+  dataset_seed: 123
+  fp64: false
+  print_grad: false
+  save_debug_data: false
+
+dataset:
+  # Rebuilt from bamboo_mixer/data_oss with a reproducible 70/15/15 split.
+  - config: "run/bamboo_raw_data/ft_train/dataset_config.yaml"
+    valid_config: "run/bamboo_raw_data/ft_valid/dataset_config.yaml"
+    valid_root: true
+    batch_size: 512
+    shuffle: true
+    loss_weight: 1.0
+    num_workers: 4
+    prefetch_factor: 4
+    loss:
+      - {loss_type: conductivity_explain_MAE, weight: 1.0}
+      - {loss_type: anion_ratio_explain_MAE, weight: 1.0}
+      - {loss_type: property_effect_L1, weight: 0.0005, valid_weight: 0.0,
+         kwargs: {task: conductivity_explain}}
+      - {loss_type: property_effect_L1, weight: 0.0005, valid_weight: 0.0,
+         kwargs: {task: anion_ratio_explain}}
+      - {loss_type: fragment_main_L1, weight: 0.001, valid_weight: 0.0,
+         kwargs: {task: conductivity_explain}}
+      - {loss_type: fragment_main_L1, weight: 0.001, valid_weight: 0.0,
+         kwargs: {task: anion_ratio_explain}}
+      - {loss_type: fragment_interaction_L1, weight: 0.002, valid_weight: 0.0,
+         kwargs: {task: conductivity_explain}}
+      - {loss_type: fragment_interaction_L1, weight: 0.002, valid_weight: 0.0,
+         kwargs: {task: anion_ratio_explain}}
+      - {loss_type: fragment_residual_L2, weight: 0.005, valid_weight: 0.0,
+         kwargs: {task: conductivity_explain}}
+      - {loss_type: fragment_residual_L2, weight: 0.005, valid_weight: 0.0,
+         kwargs: {task: anion_ratio_explain}}
+
+model:
+  check_point: "run/checkpoints/base_formula_ft.pt"
+  pretrain:
+    ckpt_path: "run/checkpoints/fixed_fragment_mono.pt"
+    model_config:
+      graph_block:
+        feature_layer:
+          atom_embedding_dim: 16
+          node_mlp_dims: [32, 32, 2]
+          edge_mlp_dims: [32, 32, 2]
+          act: gelu
+        gnn_layer:
+          gnn_type: EGT
+          gnn_dims: [32, 32, 3]
+          jk: cat
+          act: gelu
+          heads: 4
+          at_channels: 8
+          ffn_dims: [32, 2]
+        fragment_block:
+          enabled: true
+          mode: sidecar
+          freeze_base: true
+          hidden_dim: 64
+          connection_feature_dim: 9
+          num_message_layers: 1
+          neutral_only: true
+          sidecar_gate_init: 0.0
+          sidecar_gate_scale: 0.1
+      readout_block: {input_dim: 64, hidden_dims: [256, 128, 16], output_dim: 1}
+  model:
+    train_mode: finetune
+    aggr_block: {node_emb_dim: 32, node_att_dim: 32, edge_emb_dim: 32, edge_att_dim: 32}
+    readout_block: {input_dim: 384, hidden_dims: [512, 128, 16], output_dim: 1}
+    anion_block: {input_dim: 400, hidden_dims: [512, 128, 16], output_dim: 1}
+    property_fragment_explanation_block:
+      enabled: true
+      input_dim: 64
+      condition_input_dim: 130
+      hidden_dim: 64
+      main_rank: 16
+      pair_rank: 8
+      main_scale: 0.1
+      interaction_scale: 0.05
+      # All terms of anion_ratio_explain are logits; sigmoid is applied only
+      # after salt reference + property + fragment residual are summed.
+      residual_bound: 1.0
+      task_names: [conductivity_explain, anion_ratio_explain]
+      task_output_activations: {conductivity_explain: identity, anion_ratio_explain: sigmoid}
+      property_names: [dc, vis, Tm]
+      property_centers: [0.5, 0.5, 0.5]
+      property_scales: [0.25, 0.25, 0.25]
+      property_effect_scale: 0.25
+      property_bound: 1.0
+      cross_molecule_only: true
+      diagnostic_top_k_pairs: -1
+      freeze_base_formula: true
+      train_readout_pred: false
+
+training:
+  valid_interval: 2
+  ckpt_interval: 100
+  max_epoch: 1000
+  amp: false
+  grad_clip: 5.0
+  optimizer: {type: RAdam, lr: 5.0e-4}
+  scheduler: {type: ReduceLROnPlateau, factor: 0.8, patience: 5, threshold_mode: abs, threshold: 1.0e-6, min_lr: 1.0e-7}
+  early_stop_patience: 30
+  ignore_tolerance: 1.0e-6
