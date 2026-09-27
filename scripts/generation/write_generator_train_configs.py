@@ -33,6 +33,20 @@ def common(work, dataset_config, batch_size, max_epoch, lr, seed):
     }
 
 
+def relocated_dataset_config(root):
+    """Bind a run to its actual data location without editing shared source YAML."""
+    data_dir = (root / "generator_data").resolve()
+    source = data_dir / "dataset_config.yaml"
+    config = yaml.safe_load(source.read_text())
+    if not (data_dir / "processed_data.pkl").is_file():
+        raise FileNotFoundError(f"Missing processed data: {data_dir}")
+    config["save_dir"] = str(data_dir)
+    target = root / "configs" / "dataset.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(config, sort_keys=False))
+    return target
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment-dir", required=True)
@@ -73,7 +87,7 @@ def main():
     mechanism_auxiliary_schema = MECHANISM_AUXILIARY_SCHEMAS[
         args.mechanism_auxiliary_targets]
     root = Path(args.experiment_dir)
-    dataset_config = root / "generator_data" / "dataset_config.yaml"
+    dataset_config = relocated_dataset_config(root)
     vocab = root / "candidate_pool"
     config_dir = root / "configs"
     config_dir.mkdir(parents=True, exist_ok=True)

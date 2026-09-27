@@ -27,13 +27,14 @@ GROUP_LABELS = {
     "G0-MA-shuffle": "G0-MA-shuffle fixed-Bamboo-vocabulary shuffled interaction auxiliary supervision",
     "G0-MA-sigma": "G0-MA-sigma fixed-Bamboo-vocabulary I_sigma-only auxiliary supervision",
     "G0-MA-r": "G0-MA-r fixed-Bamboo-vocabulary I_r-only auxiliary supervision",
-    "G0-MA-joint": "G0-MA-joint fixed-Bamboo-vocabulary I_sigma+I_r auxiliary supervision",
     "G0-I": "G0-I Bamboo-vocabulary interaction coverage",
     "G1": "G1 random/diverse pool",
     "G2-b": "G2-b fixed Bamboo vocabulary",
     "G2-b-Q": "G2-b-Q matched random control",
     "G2-b-I": "G2-b-I interaction-coverage selection",
     "G1-Q": "G1-Q matched random control",
+    "G1-MA": "G1-MA factual interaction-residual auxiliary supervision",
+    "G1-MA-shuffle": "G1-MA-shuffle within-cell shuffled interaction-residual auxiliary supervision",
     "G1-I": "G1-I interaction-coverage selection",
     "G2-Q": "G2-Q matched random control",
     "G2-M": "G2-M matched factual mechanism condition",
@@ -49,9 +50,9 @@ GROUP_LABELS = {
 }
 GROUPS = tuple(GROUP_LABELS)
 COMPARISON_ORDER = (
-    "G0", "G0-Q", "G0-M", "G0-MA", "G0-MA-shuffle", "G0-MA-sigma", "G0-MA-r", "G0-MA-joint", "G0-I",
+    "G0", "G0-Q", "G0-M", "G0-MA", "G0-MA-shuffle", "G0-MA-sigma", "G0-MA-r", "G0-I",
     "G2-b", "G2-b-Q", "G2-b-I",
-    "G1", "G1-Q", "G1-I",
+    "G1", "G1-Q", "G1-MA", "G1-MA-shuffle", "G1-I",
     "G2", "G2-Q", "G2-M", "G2-M-shuffle", "G2-MA", "G2-MA-shuffle", "G2-MA-sigma", "G2-MA-r", "G2-MA-joint", "G2-I",
 )
 MAX_TRUSTED_CONDUCTIVITY = 100.0
@@ -112,6 +113,14 @@ GROUP_DESIGNS = {
         "source": "G1 随机/多样性 62 溶剂词表；从同一 2×oracle 标注候选中按 (σ、r、溶剂数) 配额随机抽取 30000 条，重训 diffusion + decoder",
         "goal": "作为 G1-I 的严格随机对照，隔离候选池扩大、配额保持与交互覆盖选择的影响。",
     },
+    "G1-MA": {
+        "source": "复用同 seed 的 G1-Q 随机/多样性 62 溶剂词表、30,000 条 synthetic 配方、σ/r 标签和 decoder；diffusion 条件仍仅为 (σ,r)，训练期以真实 [Iσ⊥、Ir⊥] 交互残差为 latent 辅助监督",
+        "goal": "检验真实交互残差辅助监督在随机候选词表中能否改善联合条件生成；与 G1-Q 的差异不包含词表、数据或 decoder 变化。",
+    },
+    "G1-MA-shuffle": {
+        "source": "与同 seed G1-MA 完全共享随机词表、30,000 条 synthetic 配方、σ/r 标签、二维生成条件和 decoder；仅在相同 (σ,r,溶剂数) 格内打乱完整 [Iσ⊥、Ir⊥] 的配方—标签配对",
+        "goal": "作为 G1-MA 的反事实对照，排除“仅加入辅助损失”而非真实交互配对造成改善的解释。",
+    },
     "G1-I": {
         "source": "与 G1-Q 共享随机/多样性词表、候选构造、数量与 (σ、r、溶剂数) 配额；仅在每格中保持 σ 解释交互低/中/高覆盖，重训 diffusion + decoder",
         "goal": "检验交互覆盖在随机/多样性词表中是否改善联合条件可行性。",
@@ -160,10 +169,6 @@ GROUP_DESIGNS = {
         "source": "复用 G0-Q 的固定 Bamboo 词表 synthetic 配方、二维 (σ、r) 条件与共享 decoder；训练期只监督 Ir⊥。",
         "goal": "检验固定 Bamboo 词表下 Ir 是否造成 r 或联合条件的负迁移。",
     },
-    "G0-MA-joint": {
-        "source": "复用 G0-Q 的固定 Bamboo 词表 synthetic 配方、二维 (σ、r) 条件与共享 decoder；训练期联合监督 [Iσ⊥、Ir⊥]。",
-        "goal": "作为固定 Bamboo 词表下显式 σ+r MA 对照。",
-    },
     "G3": {
         "source": "复用 G2 生成器与候选池，在温度—浓度网格上进行鲁棒重排序",
         "goal": "检验后处理的鲁棒排序能否提高有限实验预算下候选的可用性。",
@@ -206,12 +211,12 @@ def formula_label(row, solvents, group, threshold=.02):
     bow = np.asarray(row["bow"], dtype=float)
     terms = []
     for index in np.where(bow[:len(solvents)] > threshold)[0]:
-        identity = (solvents[index]["name"] if group in {"G0", "G0-Q", "G0-M", "G0-MA", "G0-MA-shuffle", "G0-MA-sigma", "G0-MA-r", "G0-MA-joint", "G0-I", "G2-b", "G2-b-Q", "G2-b-I"}
+        identity = (solvents[index]["name"] if group in {"G0", "G0-Q", "G0-M", "G0-MA", "G0-MA-shuffle", "G0-MA-sigma", "G0-MA-r", "G0-I", "G2-b", "G2-b-Q", "G2-b-I"}
                     else solvents[index]["smiles"])
         terms.append(f"{identity} ({bow[index]:.2f})")
     if not terms:
         index = int(np.argmax(bow[:len(solvents)]))
-        identity = (solvents[index]["name"] if group in {"G0", "G0-Q", "G0-M", "G0-MA", "G0-MA-shuffle", "G0-MA-sigma", "G0-MA-r", "G0-MA-joint", "G0-I", "G2-b", "G2-b-Q", "G2-b-I"}
+        identity = (solvents[index]["name"] if group in {"G0", "G0-Q", "G0-M", "G0-MA", "G0-MA-shuffle", "G0-MA-sigma", "G0-MA-r", "G0-I", "G2-b", "G2-b-Q", "G2-b-I"}
                     else solvents[index]["smiles"])
         terms.append(f"{identity} ({bow[index]:.2f})")
     return " + ".join(terms)
@@ -318,6 +323,8 @@ def summarize_group(root, group, target, selection_budget):
                        "fixed-Bamboo-vocabulary explicit mechanism condition" if group == "G0-M" else
                        "fixed-Bamboo-vocabulary factual interaction-residual auxiliary supervision" if group == "G0-MA" else
                        "fixed-Bamboo-vocabulary within-cell shuffled interaction-residual auxiliary supervision" if group == "G0-MA-shuffle" else
+                       "fixed-Bamboo-vocabulary I_sigma-only interaction-residual auxiliary supervision" if group == "G0-MA-sigma" else
+                       "fixed-Bamboo-vocabulary I_r-only interaction-residual auxiliary supervision" if group == "G0-MA-r" else
                        "random/diverse 62-solvent pool" if group == "G1" else
                        "Bamboo-vocabulary sigma-interaction coverage selection" if group == "G0-I" else
                        "fixed Bamboo 62-solvent vocabulary ablation" if group == "G2-b" else
@@ -326,6 +333,9 @@ def summarize_group(root, group, target, selection_budget):
                        "within-cell shuffled [I_sigma, I_r] diffusion condition" if group == "G2-M-shuffle" else
                        "factual [I_sigma_perp, I_r_perp] auxiliary supervision with 2D (sigma, r) generation condition" if group == "G2-MA" else
                        "within-cell shuffled [I_sigma_perp, I_r_perp] auxiliary supervision with 2D (sigma, r) generation condition" if group == "G2-MA-shuffle" else
+                       "I_sigma-only auxiliary supervision with 2D (sigma, r) generation condition" if group == "G2-MA-sigma" else
+                       "I_r-only auxiliary supervision with 2D (sigma, r) generation condition" if group == "G2-MA-r" else
+                       "joint [I_sigma_perp, I_r_perp] auxiliary supervision with 2D (sigma, r) generation condition" if group == "G2-MA-joint" else
                        "within-condition sigma-interaction coverage selection" if group in {"G2-b-I", "G1-I", "G2-I"} else
                        "fragment/property guided 62-solvent pool" if group == "G2" else
                        "G2 generator + robustness/explanation re-ranking"),

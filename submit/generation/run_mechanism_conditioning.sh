@@ -18,22 +18,20 @@ case "$GROUP" in
   G2-M)
     PREP_MODE="true"
     BASELINE_GROUP="G2-Q"
-    DEFAULT_SOURCE_GROUP="run/generation_interaction_coverage_comparison/G2-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_interaction_coverage_comparison/G2-Q/train_decoder"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q/train_decoder"
     ;;
   G2-M-shuffle)
     PREP_MODE="shuffle_within_cell"
     BASELINE_GROUP="G2-Q"
-    DEFAULT_SOURCE_GROUP="run/generation_interaction_coverage_comparison/G2-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_interaction_coverage_comparison/G2-Q/train_decoder"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q/train_decoder"
     ;;
   G0-M)
     PREP_MODE="true"
     BASELINE_GROUP="G0-Q"
-    # The synthetic Q data and vocabulary were retained under the condition
-    # folder after the original fixed-Bamboo-vocabulary comparison.
-    DEFAULT_SOURCE_GROUP="run/generation_bamboo_composition_comparison/condition_k20_r0p5/G2-b-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_bamboo_composition_comparison/G2-b-Q/train_decoder"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q/train_decoder"
     ;;
   *)
     echo "Unknown group: $GROUP (expected G2-M|G2-M-shuffle|G0-M)" >&2

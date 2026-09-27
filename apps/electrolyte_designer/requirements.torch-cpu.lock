@@ -1,0 +1,5 @@
+# CPU-only PyTorch wheel for Linux x86_64 / CPython 3.11.
+# Install this file before requirements.lock, with --no-deps.  The remaining
+# PyTorch dependencies are pinned in requirements.lock and installed from PyPI.
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.7.1+cpu

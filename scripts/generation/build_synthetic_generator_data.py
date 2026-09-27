@@ -10,6 +10,7 @@ BOW, and the frozen oracle's jointly predicted conductivity and anion ratio.
 import argparse
 import json
 import math
+import os
 import random
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -19,17 +20,7 @@ import torch
 import yaml
 from formula_design.data import Data, FormulaData, collate_data
 from formula_design.mol import Molecule
-from formula_design.predictor import MolMix, Mono
-
-
-def load_oracle(config_path, checkpoint):
-    config = yaml.safe_load(Path(config_path).read_text())
-    pretrain = config["model"]["pretrain"]["model_config"]
-    model = Mono(**pretrain)
-    model.load_ckpt(str(Path(checkpoint) / "pretrain.pt"))
-    formula = MolMix(model, **config["model"]["model"])
-    formula.load_ckpt(str(Path(checkpoint) / "optimal.pt"))
-    return formula.eval().to("cuda")
+from formula_design.predictor.oracle_adapter import load_bamboo_oracle as load_oracle
 
 
 _BAMBOO_SOLVENT_COUNT_WEIGHTS = {
@@ -37,6 +28,30 @@ _BAMBOO_SOLVENT_COUNT_WEIGHTS = {
     # run/synthetic_data.json.  Its training regime is mostly 4--6 solvents.
     1: 62, 2: 1891, 3: 2778, 4: 5723, 5: 8406, 6: 11140,
 }
+
+
+def atomic_torch_save(value, path):
+    """Publish a torch artifact only after its complete payload is written."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(value, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def atomic_write_text(path, text):
+    """Atomically publish a small UTF-8 sidecar file."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def bamboo_count_schedule(total_count, max_solvents, seed):
@@ -711,14 +726,16 @@ def main():
     synthetic_formula_records = [synthetic_formula_records[index]
                                  for index in selected_indices]
 
-    torch.save(generator_data, output / "processed_data.pkl")
-    (output / "synthetic_data.json").write_text(
-        json.dumps(synthetic_formula_records, indent=2) + "\n")
-    (output / "dataset_config.yaml").write_text(yaml.safe_dump({
+    # Publish the required files atomically.  Metadata is written last, so a
+    # reader which requires all four files never observes a partial dataset.
+    atomic_torch_save(generator_data, output / "processed_data.pkl")
+    atomic_write_text(output / "synthetic_data.json",
+                      json.dumps(synthetic_formula_records, indent=2) + "\n")
+    atomic_write_text(output / "dataset_config.yaml", yaml.safe_dump({
         "data_cls": "FormulaData", "save_dir": str(output),
         "json_path": "", "key_map": {}, "kwargs": {},
     }, sort_keys=False))
-    (output / "synthetic_metadata.json").write_text(json.dumps({
+    atomic_write_text(output / "synthetic_metadata.json", json.dumps({
         "num_formulas": args.num_formulas,
         "candidate_formulas_before_selection": candidate_count,
         "oracle_scored_formula_count": anion_window_candidate_count,

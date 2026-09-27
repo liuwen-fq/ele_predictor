@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "mode": "legacy_reproduction",
+  "source_q": "run/generation_mechanism_auxiliary_comparison/G0-Q-comp/G0_seed_123/G0-Q",
+  "reference_root": "run/generation_mechanism_auxiliary_comparison/G0-Q-comp",
+  "output_root": "run/reproduction/G0",
+  "seeds": [
+    123,
+    456,
+    789
+  ],
+  "environment": {
+    "CONDA_ENV": "bamboo",
+    "TRAIN_MAX_EPOCH": "500",
+    "GEN_BATCHES": "8",
+    "GEN_BATCH_SIZE": "128",
+    "TARGET_CONDUCTIVITY": "20.0",
+    "ANION_RATIO": "0.5",
+    "TEMPERATURE_C": "25.0",
+    "SALT_MOLAR_RATIO": "0.10",
+    "ANION_RATIO_TOLERANCE": "0.10",
+    "MECHANISM_AUX_WEIGHT": "0.05",
+    "MECHANISM_AUX_HIDDEN_DIM": "192",
+    "ORACLE_CONFIG": "config/test_results/anion_ratio_property_fragment_predict.yaml",
+    "ORACLE_CKPT": "run/anion_ratio_property_fragment_explanation/ckpt_formula_ft"
+  },
+  "comparison": {
+    "absolute_tolerance": 1e-06,
+    "relative_tolerance": 1e-05,
+    "metrics": [
+      "kappa_mae_mS_cm",
+      "kappa_rmse_mS_cm",
+      "anion_ratio_pred_mae_from_condition",
+      "joint_normalized_mae",
+      "joint_within_kappa_pm2_ratio_pm0.1",
+      "selected_kappa_mae_mS_cm",
+      "selected_joint_normalized_mae"
+    ]
+  }
+}

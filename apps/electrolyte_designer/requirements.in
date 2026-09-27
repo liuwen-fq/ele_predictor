@@ -1,0 +1,5 @@
+# Top-level UI requirements used when refreshing the fully pinned runtime lock.
+# Do not install this file alone: direct users should follow README.md and
+# install requirements.torch-cpu.lock followed by requirements.lock.
+streamlit>=1.50,<2
+altair>=5,<7

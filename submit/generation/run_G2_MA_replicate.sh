@@ -27,7 +27,7 @@ esac
 }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-run/generation_mechanism_auxiliary_replicates/G2_seed_${REPLICA_SEED}}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_${REPLICA_SEED}}"
 MAIN="$ROOT/submit/generation/run_mechanism_auxiliary.sh"
 
 if [[ "$GROUP" == "G2-Q" ]]; then

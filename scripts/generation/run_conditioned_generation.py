@@ -14,16 +14,7 @@ from torch.utils.data import DataLoader
 from formula_design.data import FormulaData, collate_data
 from formula_design.generator import FormulaDecoder, FormulaDiffusion
 from formula_design.mol import Molecule
-from formula_design.predictor import MolMix, Mono
-
-
-def load_oracle(config_path, checkpoint):
-    config = yaml.safe_load(Path(config_path).read_text())
-    mono = Mono(**config["model"]["pretrain"]["model_config"])
-    mono.load_ckpt(str(Path(checkpoint) / "pretrain.pt"))
-    model = MolMix(mono, **config["model"]["model"])
-    model.load_ckpt(str(Path(checkpoint) / "optimal.pt"))
-    return model.eval().to("cuda")
+from formula_design.predictor.oracle_adapter import load_bamboo_oracle as load_oracle
 
 
 def load_generator(config_path, checkpoint, model_cls, model_key):

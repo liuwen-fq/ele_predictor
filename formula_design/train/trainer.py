@@ -19,6 +19,7 @@ import math
 import os
 import random
 import textwrap
+import tempfile
 import zipfile
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
@@ -43,6 +44,22 @@ from formula_design.generator import (BowDecoder, FormulaDecoder,
 from formula_design.predictor import MolMix, Mono
 from formula_design.train.loss import LossType, loss_func
 from formula_design.utils import get_timestamp, setup_default_logging
+
+
+def atomic_torch_save(value, destination):
+    """Do not truncate an inode that may still back mmap-loaded tensors."""
+    destination = os.fspath(destination)
+    fd, temporary = tempfile.mkstemp(prefix='.checkpoint-', suffix='.tmp',
+                                     dir=os.path.dirname(os.path.abspath(destination)))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            torch.save(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def safe_barrier():
@@ -349,10 +366,13 @@ class BaseTrainer:
                     for name in self.trainer_state_variables
                 },
             }
-            torch.save(sd, ckpt_savepath)
+            atomic_torch_save(sd, ckpt_savepath)
 
     def load_ckpt(self, ckpt_path: str, model_only=True):
-        sd = torch.load(ckpt_path, map_location=self.device)
+        # Old histories may contain views backed by large autograd storages.
+        # Map on CPU lazily; only model/optimizer states move to the device.
+        sd = torch.load(ckpt_path, map_location='cpu', mmap=True,
+                        weights_only=False)
         model = self.model.module if self.world_size > 1 else self.model
         try:
             model.load_state_dict(sd['model_state_dict'])
@@ -376,7 +396,14 @@ class BaseTrainer:
             self.scheduler.load_state_dict(sd['scheduler_state_dict'])
 
         for k in self.trainer_state_variables:
-            setattr(self, k, sd['trainer_state_dict'][k])
+            value = sd['trainer_state_dict'][k]
+            if k == 'loss_term_history':
+                value = [[[epoch, step, {
+                    name: term.detach().cpu().clone() if isinstance(term, torch.Tensor)
+                    else torch.tensor(term)
+                    for name, term in terms.items()}]
+                    for epoch, step, terms in history] for history in value]
+            setattr(self, k, value)
 
     def save_optimal(self):
         optimal_state_dict: dict[
@@ -386,7 +413,7 @@ class BaseTrainer:
         for k, v in optimal_state_dict.items():
             self.optimal_state_dict[k] = v.clone().detach()
         if self.rank == 0:
-            torch.save({'model_state_dict': self.optimal_state_dict},
+            atomic_torch_save({'model_state_dict': self.optimal_state_dict},
                        self.config.optimal_path())
 
     def load_optimal(self):
@@ -514,7 +541,8 @@ class BaseTrainer:
                     self.loss_term_history[ids].append([
                         self.epoch,
                         step,
-                        loss_terms,
+                        {name: value.detach().cpu().clone()
+                         for name, value in loss_terms.items()},
                     ])
                     loss_str = ", ".join([
                         f"{name}: {value.item():.4f}"

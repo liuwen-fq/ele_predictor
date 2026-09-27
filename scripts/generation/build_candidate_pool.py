@@ -30,7 +30,7 @@ from formula_design.predictor import Mono
 # sibling analysis folder explicitly so this entry point also works when
 # invoked directly by a shell pipeline.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test_results"))
-from analyze_conductivity_fragment_attributions import physical_property_value
+from analyze_conductivity_fragment_attributions import physical_property_value, PROPERTY_NORMALIZATION_PATH
 
 DIRECT_PROPERTIES = ("dc", "vis", "Tm")
 
@@ -184,8 +184,15 @@ def predict_properties(entries, model, batch_size):
     return output
 
 
-def property_score(values, constraints):
-    """A flat, soft property window; values inside get no extra extremum bonus."""
+def property_score(values, constraints, property_weights=None):
+    """Score soft property windows with explicit per-property importance.
+
+    The common eligibility gates remain responsible for excluding grossly
+    unsuitable molecules.  This score ranks the remaining candidates.  A
+    caller can therefore make dielectric constant and viscosity more important
+    than melting point without changing legacy experiment defaults.
+    """
+    property_weights = property_weights or {}
     score, details = 0.0, []
     for row in constraints:
         name = row["property"]
@@ -195,8 +202,9 @@ def property_score(values, constraints):
         value, width = values[name], max(upper - lower, 1e-8)
         distance = 0.0 if lower <= value <= upper else min(
             abs(value - lower), abs(value - upper)) / width
-        score += 1.0 - min(distance, 2.0)
-        details.append(f"{name}={value:.4g}")
+        importance = float(property_weights.get(name, 1.0))
+        score += importance * (1.0 - min(distance, 2.0))
+        details.append(f"{name}={value:.4g};w={importance:.3g}")
     return score, ";".join(details)
 
 
@@ -317,18 +325,32 @@ def diverse_top(rows, pool_size, seed):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("baseline", "random", "guided"), required=True)
+    parser.add_argument("--mode", choices=("baseline", "random", "guided", "conditional"), required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--baseline-solvents", required=True)
     parser.add_argument("--salts", required=True)
     parser.add_argument("--mono-data", help="Legacy raw pretraining source.")
     parser.add_argument("--candidate-source",
                         help="Reusable common eligible-pool JSON.")
+    parser.add_argument("--precomputed-candidate-source",
+                        help="Reusable catalogue whose records already contain "
+                        "frozen `predicted_properties`.  This skips repeated "
+                        "mono-model inference while retaining encoder checks.")
     parser.add_argument("--property-constraints")
+    parser.add_argument("--conditional-task", help="Explicit fitting sources and target condition JSON")
     parser.add_argument("--guided-selection-strategy",
                         choices=("legacy_topk", "coverage_v1"),
                         default="coverage_v1")
     parser.add_argument("--guided-property-weight", type=float, default=1.0)
+    parser.add_argument("--guided-dc-score-weight", type=float, default=1.0,
+                        help="Relative dielectric-constant importance inside "
+                        "the guided soft property score.")
+    parser.add_argument("--guided-vis-score-weight", type=float, default=1.0,
+                        help="Relative viscosity importance inside the guided "
+                        "soft property score.")
+    parser.add_argument("--guided-tm-score-weight", type=float, default=1.0,
+                        help="Relative melting-point importance inside the "
+                        "guided soft property score.")
     parser.add_argument("--guided-fragment-weight", type=float, default=1.0)
     parser.add_argument("--guided-family-coverage-weight", type=float, default=0.7)
     parser.add_argument("--guided-scaffold-coverage-weight", type=float, default=0.25)
@@ -337,6 +359,12 @@ def main():
                         help="G2-only symmetric penalty for a vocabulary with "
                         "one-sided anion-ratio motif tendencies; it is not a "
                         "single-molecule ratio predictor or hard filter.")
+    parser.add_argument("--minimum-dc", type=float,
+                        help="Optional shared candidate-universe lower bound "
+                        "for frozen predicted dielectric constant.")
+    parser.add_argument("--maximum-vis", type=float,
+                        help="Optional shared candidate-universe upper bound "
+                        "for frozen predicted viscosity.")
     parser.add_argument("--model-config")
     parser.add_argument("--mono-checkpoint")
     parser.add_argument("--pool-size", type=int, default=62)
@@ -346,9 +374,40 @@ def main():
     parser.add_argument("--batch-size", type=int, default=256)
     args = parser.parse_args()
 
+    conditional_task = rules = signature = None
+    if args.mode == "conditional":
+        from formula_design.conditional_screening import load_task, fit_rules, select_candidates, file_hash
+        if not args.conditional_task:
+            raise ValueError("conditional mode requires --conditional-task")
+        conditional_task = load_task(args.conditional_task)
+        # The existing property oracle/catalog represents molecular properties
+        # at 25 C. Other contexts need a temperature-aware property adapter.
+        if conditional_task['target']['temperature_c'] != 25.:
+            raise ValueError("Current property catalog adapter supports 25 C only")
+        files = [args.conditional_task, args.salts, args.precomputed_candidate_source or args.candidate_source or args.mono_data,
+                 __file__, str(Path(__file__).resolve().parents[2] / 'formula_design/conditional_screening.py')]
+        files += [source['path'] for source in conditional_task['sources']]
+        files += [str(PROPERTY_NORMALIZATION_PATH)]
+        files += [v for v in (args.model_config, args.mono_checkpoint) if v]
+        signature = {'args': vars(args), 'sha256': {str(Path(f).resolve()): file_hash(f) for f in files if f}}
+        dest = Path(args.output_dir)
+        manifest = dest / 'conditional_manifest.json'
+        if manifest.exists():
+            saved = json.loads(manifest.read_text())
+            if saved['signature'] != signature:
+                raise ValueError("Conditional inputs changed: use a fresh experiment/output directory")
+            if any(not (dest / name).is_file() or file_hash(dest / name) != digest for name, digest in saved['outputs'].items()):
+                raise ValueError("Conditional output missing or modified; use a fresh output directory")
+            print("Reusing verified conditional vocabulary")
+            return
+        if dest.exists() and any(dest.iterdir()):
+            raise ValueError("Refusing untracked/incomplete conditional pool; use a fresh output directory")
+        rules = fit_rules(conditional_task, physical_property_value)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     salts = json.loads(Path(args.salts).read_text())
+    if conditional_task and set(conditional_task['target']['salts']) != {s['name'] for s in salts}:
+        raise ValueError("Task salt identities must match the generator salt vocabulary")
     if args.mode == "baseline":
         solvents = json.loads(Path(args.baseline_solvents).read_text())
         if len(solvents) != args.pool_size:
@@ -357,20 +416,34 @@ def main():
                  "selection": "fixed_bamboo_vocabulary", "total_score": ""}
                 for item in solvents]
     else:
-        if bool(args.mono_data) == bool(args.candidate_source):
-            raise ValueError("random/guided modes require exactly one of --mono-data or --candidate-source")
-        if not all((args.model_config, args.mono_checkpoint)):
+        sources = [args.mono_data, args.candidate_source,
+                   args.precomputed_candidate_source]
+        if sum(source is not None for source in sources) != 1:
+            raise ValueError(
+                "random/guided modes require exactly one of --mono-data, "
+                "--candidate-source, or --precomputed-candidate-source")
+        use_precomputed = args.precomputed_candidate_source is not None
+        if not use_precomputed and not all((args.model_config, args.mono_checkpoint)):
             raise ValueError(
                 "random/guided modes require model config and checkpoint for "
                 "the shared encoder/property eligibility preflight")
         if args.mode == "guided" and not args.property_constraints:
             raise ValueError("guided mode requires property constraints")
-        raw = json.loads(Path(args.candidate_source or args.mono_data).read_text())
+        source_path = (args.precomputed_candidate_source or args.candidate_source
+                       or args.mono_data)
+        raw = json.loads(Path(source_path).read_text())
         unique = {}
         for item in raw:
             smiles = item.get("smiles", "")
             if smiles and smiles not in unique:
-                unique[smiles] = {"name": item.get("name", ""), "smiles": smiles}
+                unique[smiles] = {
+                    "name": item.get("name", ""),
+                    "smiles": smiles,
+                    **({"predicted_properties": item.get("predicted_properties")}
+                       if use_precomputed else {}),
+                }
+        if args.mode == 'conditional' and len({v['name'] for v in unique.values()}) != len(unique):
+            raise ValueError('Candidate names must be unique for property lookup')
         basic_eligible, basic_rejected = [], []
         for item in unique.values():
             reason = candidate_ineligibility_reason(item)
@@ -384,17 +457,30 @@ def main():
             rng = random.Random(args.seed)
             rng.shuffle(candidates)
             candidates = candidates[:args.screen_size]
-        predictions = predict_properties(candidates, load_mono(
-            args.model_config, args.mono_checkpoint), args.batch_size)
+        if use_precomputed:
+            predictions = {
+                item["name"]: item.get("predicted_properties")
+                for item in candidates
+            }
+        else:
+            predictions = predict_properties(candidates, load_mono(
+                args.model_config, args.mono_checkpoint), args.batch_size)
         eligible, preflight_rejected = [], []
         for item in candidates:
             values = predictions.get(item["name"])
             if values is None:
                 preflight_rejected.append({**item, "eligibility_status": "rejected",
                                            "eligibility_reason": "property_prediction_failed"})
-            elif not all(np.isfinite(value) for value in values.values()):
+            elif (not all(name in values for name in DIRECT_PROPERTIES)
+                  or not all(np.isfinite(value) for value in values.values())):
                 preflight_rejected.append({**item, "eligibility_status": "rejected",
                                            "eligibility_reason": "nonfinite_property_prediction"})
+            elif args.minimum_dc is not None and values["dc"] < args.minimum_dc:
+                preflight_rejected.append({**item, "eligibility_status": "rejected",
+                                           "eligibility_reason": "predicted_dc_below_shared_min"})
+            elif args.maximum_vis is not None and values["vis"] > args.maximum_vis:
+                preflight_rejected.append({**item, "eligibility_status": "rejected",
+                                           "eligibility_reason": "predicted_vis_above_shared_max"})
             else:
                 eligible.append({**item, "eligibility_status": "eligible",
                                  "eligibility_reason": ""})
@@ -405,16 +491,25 @@ def main():
         audit_rows = basic_rejected + preflight_rejected + eligible
         write_csv(output / "candidate_eligibility_audit.csv", audit_rows)
         write_csv(output / "eligible_pool.csv", eligible)
-        if args.mode == "random":
+        if args.mode == "conditional":
+            rows = select_candidates(eligible, predictions, rules, args.pool_size, args.seed)
+            (output / 'conditional_rules.json').write_text(json.dumps(rules, indent=2) + '\n')
+        elif args.mode == "random":
             rows = diverse_top([{**item, "selection": "size_matched_random_diverse", "total_score": 0.0}
                                 for item in eligible], args.pool_size, args.seed)
         else:
             constraints = read_csv(args.property_constraints)
+            guided_property_weights = {
+                "dc": args.guided_dc_score_weight,
+                "vis": args.guided_vis_score_weight,
+                "Tm": args.guided_tm_score_weight,
+            }
             scored = []
             for item in eligible:
                 values = predictions.get(item["name"])
                 profile = fragment_profile(item["smiles"])
-                prop, property_values = property_score(values, constraints)
+                prop, property_values = property_score(
+                    values, constraints, guided_property_weights)
                 scored.append({**item, "selection": "fragment_property_soft_constraints",
                                "property_window_score": prop,
                                "property_score": prop,
@@ -449,12 +544,22 @@ def main():
     write_csv(output / "candidate_pool_scores.csv", rows)
     (output / "candidate_pool_metadata.json").write_text(json.dumps({
         "mode": args.mode, "pool_size": args.pool_size,
+        "conditional_task": conditional_task,
+        "conditional_fallback": rules['fallback'] if rules else None,
         "screen_size": args.screen_size if args.mode != "baseline" else None,
-        "candidate_source": args.candidate_source if args.mode != "baseline" else None,
+        "candidate_source": (args.precomputed_candidate_source or args.candidate_source
+                             or args.mono_data) if args.mode != "baseline" else None,
+        "precomputed_property_catalog": (args.precomputed_candidate_source
+                                          if args.mode != "baseline" else None),
         "seed": args.seed,
         "guided_selection": ({
             "strategy": args.guided_selection_strategy,
             "property_weight": args.guided_property_weight,
+            "property_component_weights": {
+                "dc": args.guided_dc_score_weight,
+                "vis": args.guided_vis_score_weight,
+                "Tm": args.guided_tm_score_weight,
+            },
             "fragment_weight": args.guided_fragment_weight,
             "family_coverage_weight": args.guided_family_coverage_weight,
             "scaffold_coverage_weight": args.guided_scaffold_coverage_weight,
@@ -465,12 +570,23 @@ def main():
             "basic_unique_candidates": len(unique) if args.mode != "baseline" else None,
             "screened_candidates": len(candidates) if args.mode != "baseline" else None,
             "eligible_candidates": len(eligible) if args.mode != "baseline" else None,
+            "minimum_dc": args.minimum_dc if args.mode != "baseline" else None,
+            "maximum_vis": args.maximum_vis if args.mode != "baseline" else None,
             "rejected_before_screen": len(basic_rejected) if args.mode != "baseline" else None,
             "rejected_after_preflight": len(preflight_rejected) if args.mode != "baseline" else None,
             "audit_file": "candidate_eligibility_audit.csv" if args.mode != "baseline" else None,
             "eligible_pool_file": "eligible_pool.csv" if args.mode != "baseline" else None,
         },
     }, indent=2) + "\n")
+
+    if signature is not None:
+        names = ('solvents.json', 'salts.json', 'candidate_pool_scores.csv',
+                 'candidate_pool_metadata.json', 'conditional_rules.json',
+                 'candidate_eligibility_audit.csv', 'eligible_pool.csv')
+        manifest = {'signature': signature, 'outputs': {name: file_hash(output / name) for name in names}}
+        temporary = output / '.conditional_manifest.tmp'
+        temporary.write_text(json.dumps(manifest, indent=2) + '\n')
+        temporary.replace(output / 'conditional_manifest.json')
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "adapter": "bamboo_prediction_export_v1",
+  "model_id": "anion_ratio_property_fragment_explanation",
+  "sources": [{"path": "../../run/rule_fit/train_predictions.json", "role": "rule_fit", "split": "train"}],
+  "target": {
+    "conductivity_ms_cm": 20.0,
+    "anion_ratio": 0.5,
+    "conductivity_tolerance": 2.0,
+    "anion_ratio_tolerance": 0.1,
+    "temperature_c": 25.0,
+    "salt_molar_ratio": 0.1,
+    "salts": {"LiFSI": 0.5, "LiPF6": 0.5}
+  },
+  "options": {
+    "temperature_bandwidth": 10.0,
+    "concentration_bandwidth": 0.03,
+    "salt_ratio_bandwidth": 0.25,
+    "min_effective_samples": 5,
+    "exploration_fraction": 0.15
+  }
+}

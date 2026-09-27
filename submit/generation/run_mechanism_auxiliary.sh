@@ -8,15 +8,15 @@
 # residualized explanation interaction pair from the denoiser's reconstructed
 # clean latent embedding.
 #
-# G2-MA and G2-MA-shuffle reuse the exact same completed G2-Q synthetic
-# formulas, BOWs, sigma/r labels, vocabulary, decoder, training budget, and
-# generation settings.  The shuffled arm changes only the within-cell pairing
-# of the two auxiliary residual labels.  G0-MA is the corresponding
-# fixed-Bamboo-vocabulary, current-oracle controlled arm; it is not the
-# released Bamboo checkpoint.
+# Every MA/shuffle pair reuses the same completed Q synthetic formulas, BOWs,
+# sigma/r labels, vocabulary, decoder, training budget, and generation
+# settings.  The shuffled arm changes only the within-cell pairing of the two
+# auxiliary residual labels.  G0, G1, and G2 therefore respectively test the
+# fixed Bamboo, random-pool, and explain-guided-pool settings under the same
+# training-time mechanism intervention; none is the released Bamboo checkpoint.
 set -euo pipefail
 
-GROUP="${1:?usage: $0 G2-Q|G2-MA|G2-MA-shuffle|G2-MA-sigma|G2-MA-r|G2-MA-joint|G0-MA|G0-MA-shuffle|G0-MA-sigma|G0-MA-r|G0-MA-joint}"
+GROUP="${1:?usage: $0 G2-Q|G2-MA|G2-MA-shuffle|G2-MA-sigma|G2-MA-r|G2-MA-joint|G1-MA|G1-MA-shuffle|G0-Q|G0-MA|G0-MA-shuffle|G0-MA-sigma|G0-MA-r}"
 # Read this early because the standalone G2-Q replicate uses it in its
 # default output directory.  The assignment below therefore must not replace
 # a seed supplied by the submission environment.
@@ -30,8 +30,8 @@ case "$GROUP" in
     PREP_MODE=""
     RETRAIN_DECODER=1
     BASELINE_GROUP="G2-Q"
-    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_replicates/G2_seed_${SEED}"
-    DEFAULT_SOURCE_GROUP="run/generation_interaction_coverage_comparison/G2-Q"
+    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_${SEED}"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q"
     DEFAULT_SOURCE_DECODER=""
     MA_TARGETS=""
     ;;
@@ -40,8 +40,8 @@ case "$GROUP" in
     RETRAIN_DECODER=0
     BASELINE_GROUP="G2-Q"
     DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G2-comp"
-    DEFAULT_SOURCE_GROUP="run/generation_interaction_coverage_comparison/G2-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_interaction_coverage_comparison/G2-Q/train_decoder"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q/train_decoder"
     MA_TARGETS="sigma_r"
     ;;
   G2-MA-shuffle)
@@ -49,8 +49,8 @@ case "$GROUP" in
     RETRAIN_DECODER=0
     BASELINE_GROUP="G2-Q"
     DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G2-comp"
-    DEFAULT_SOURCE_GROUP="run/generation_interaction_coverage_comparison/G2-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_interaction_coverage_comparison/G2-Q/train_decoder"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q/train_decoder"
     MA_TARGETS="sigma_r"
     ;;
   G2-MA-sigma|G2-MA-r|G2-MA-joint)
@@ -58,46 +58,67 @@ case "$GROUP" in
     RETRAIN_DECODER=0
     BASELINE_GROUP="G2-Q"
     DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G2-comp"
-    DEFAULT_SOURCE_GROUP="run/generation_interaction_coverage_comparison/G2-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_interaction_coverage_comparison/G2-Q/train_decoder"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G2-comp/G2_seed_123/G2-Q/train_decoder"
     case "$GROUP" in
       G2-MA-sigma) MA_TARGETS="sigma" ;;
       G2-MA-r) MA_TARGETS="r" ;;
       G2-MA-joint) MA_TARGETS="sigma_r" ;;
     esac
     ;;
+  G1-MA|G1-MA-shuffle)
+    PREP_MODE="true"
+    [[ "$GROUP" == "G1-MA-shuffle" ]] && PREP_MODE="shuffle_within_cell"
+    RETRAIN_DECODER=0
+    BASELINE_GROUP="G1-Q"
+    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G1-comp/G1_seed_${SEED}"
+    # The wrapper overrides these with the same-seed G1-Q run.
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G1-comp/G1_seed_${SEED}/G1-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G1-comp/G1_seed_${SEED}/G1-Q/train_decoder"
+    MA_TARGETS="sigma_r"
+    ;;
+  G0-Q)
+    # Same-seed G0 property-only baseline.  It retrains both diffusion and
+    # decoder on the fixed Bamboo-vocabulary Q data so MA groups can reuse a
+    # matched decoder and differ only in the training-time auxiliary target.
+    PREP_MODE=""
+    RETRAIN_DECODER=1
+    BASELINE_GROUP="G0-Q"
+    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_${SEED}"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q"
+    DEFAULT_SOURCE_DECODER=""
+    MA_TARGETS=""
+    ;;
   G0-MA)
     PREP_MODE="true"
     RETRAIN_DECODER=0
     BASELINE_GROUP="G0-Q"
-    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp"
-    # The condition-specific directory retains the Q synthetic formulas and
-    # candidate vocabulary, whereas the parent comparison root retains the
-    # matching decoder checkpoint.
-    DEFAULT_SOURCE_GROUP="run/generation_bamboo_composition_comparison/condition_k20_r0p5/G2-b-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_bamboo_composition_comparison/G2-b-Q/train_decoder"
+    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_${SEED}"
+    # The shared Q synthetic set, vocabulary, and matched decoder are kept
+    # once under the canonical seed-123 source directory.
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q/train_decoder"
     MA_TARGETS="sigma_r"
     ;;
   G0-MA-shuffle)
     PREP_MODE="shuffle_within_cell"
     RETRAIN_DECODER=0
     BASELINE_GROUP="G0-Q"
-    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp"
-    DEFAULT_SOURCE_GROUP="run/generation_bamboo_composition_comparison/condition_k20_r0p5/G2-b-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_bamboo_composition_comparison/G2-b-Q/train_decoder"
+    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_${SEED}"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q/train_decoder"
     MA_TARGETS="sigma_r"
     ;;
-  G0-MA-sigma|G0-MA-r|G0-MA-joint)
+  G0-MA-sigma|G0-MA-r)
     PREP_MODE="true"
     RETRAIN_DECODER=0
     BASELINE_GROUP="G0-Q"
-    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp"
-    DEFAULT_SOURCE_GROUP="run/generation_bamboo_composition_comparison/condition_k20_r0p5/G2-b-Q"
-    DEFAULT_SOURCE_DECODER="run/generation_bamboo_composition_comparison/G2-b-Q/train_decoder"
+    DEFAULT_EXPERIMENT_ROOT="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_${SEED}"
+    DEFAULT_SOURCE_GROUP="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q"
+    DEFAULT_SOURCE_DECODER="run/generation_mechanism_auxiliary_comparison/G0-comp/G0_seed_123/G0-Q/train_decoder"
     case "$GROUP" in
       G0-MA-sigma) MA_TARGETS="sigma" ;;
       G0-MA-r) MA_TARGETS="r" ;;
-      G0-MA-joint) MA_TARGETS="sigma_r" ;;
     esac
     ;;
   *)
@@ -167,10 +188,18 @@ train_or_resume() {
   if [[ -f "$work/FINISHED" ]]; then
     record_skip "$stage" finished
   elif (( ${#checkpoints[@]} > 0 )); then
+    # A best-model file normally coexists with full epoch checkpoints.
+    # Restore optimizer/scheduler/trainer state before considering optimal.pt.
     run_stage "$stage" python3 -u scripts/train/train.py --task formula --conf "$config" --restart
   elif [[ -f "$work/optimal.pt" ]]; then
     echo "Incomplete $stage: optimal.pt exists without FINISHED/epoch checkpoint: $work" >&2
     exit 1
+  elif [[ -d "$work" ]]; then
+    # A prior failed launch may leave an empty work directory before the
+    # first checkpoint.  FormulaTrainer requires --restart whenever that
+    # directory already exists; its restart path also handles no-checkpoint
+    # starts safely.
+    run_stage "$stage" python3 -u scripts/train/train.py --task formula --conf "$config" --restart
   else
     run_stage "$stage" python3 -u scripts/train/train.py --task formula --conf "$config"
   fi
@@ -178,7 +207,7 @@ train_or_resume() {
 
 # A symlink makes the unchanged Q baseline visible to the common analyzer
 # without copying its completed data or allowing this pipeline to modify it.
-if [[ "$GROUP" != "G2-Q" && ! -e "$EXPERIMENT_ROOT/$BASELINE_GROUP" ]]; then
+if [[ "$GROUP" != "G2-Q" && "$GROUP" != "G0-Q" && ! -e "$EXPERIMENT_ROOT/$BASELINE_GROUP" ]]; then
   ln -s "$(cd "$SOURCE_GROUP_DIR" && pwd)" "$EXPERIMENT_ROOT/$BASELINE_GROUP" \
     || [[ -e "$EXPERIMENT_ROOT/$BASELINE_GROUP" ]] \
     || { echo "could not create baseline link $EXPERIMENT_ROOT/$BASELINE_GROUP" >&2; exit 1; }
@@ -187,7 +216,7 @@ if [[ ! -e "$RUN/candidate_pool" ]]; then
   ln -s "$(cd "$VOCAB_DIR" && pwd)" "$RUN/candidate_pool"
 fi
 
-if [[ "$GROUP" == "G2-Q" ]]; then
+if [[ "$GROUP" == "G2-Q" || "$GROUP" == "G0-Q" ]]; then
   # Do not duplicate or modify the fixed 30,000-row Q data.  The seed changes
   # only training/sampling randomness, which is precisely the replicate test.
   if [[ ! -e "$RUN/generator_data" ]]; then
@@ -268,7 +297,12 @@ fi
 
 if [[ "$GROUP" == G0-* ]]; then
   ANALYSIS_GROUPS=(G0-Q)
-  for arm in G0-MA G0-MA-shuffle G0-MA-sigma G0-MA-r G0-MA-joint; do
+  for arm in G0-MA G0-MA-shuffle G0-MA-sigma G0-MA-r; do
+    [[ -f "$EXPERIMENT_ROOT/$arm/generated/generated_formulas.json" ]] && ANALYSIS_GROUPS+=("$arm")
+  done
+elif [[ "$GROUP" == G1-* ]]; then
+  ANALYSIS_GROUPS=(G1-Q)
+  for arm in G1-MA G1-MA-shuffle; do
     [[ -f "$EXPERIMENT_ROOT/$arm/generated/generated_formulas.json" ]] && ANALYSIS_GROUPS+=("$arm")
   done
 else

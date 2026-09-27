@@ -199,6 +199,11 @@ nohup.out
 # filelock
 **.lock
 
+# Version-pinned runtime locks are source-controlled deployment inputs, not
+# transient file locks.
+!apps/electrolyte_designer/requirements.lock
+!apps/electrolyte_designer/requirements.torch-cpu.lock
+
 # wandb
 **/wandb/
 
@@ -208,3 +213,9 @@ packages.dot
 
 # debug
 **debug*
+
+# Reproducible experiment task configuration.
+!config/reproduction/g0_legacy.json
+
+# Conditioned screening task example is source code, not generated data.
+!config/screening/conditional_g2.example.json

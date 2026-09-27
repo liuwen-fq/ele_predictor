@@ -16,6 +16,7 @@ never changes a generation-time condition.
 
 import argparse
 import json
+import os
 import random
 from collections import defaultdict
 from pathlib import Path
@@ -103,6 +104,29 @@ TARGET_FEATURE_NAMES = {
 }
 
 
+def atomic_torch_save(value, path):
+    """Publish MA data only after its torch payload is complete."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(value, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def atomic_write_text(path, text):
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Add factual or within-cell-shuffled interaction residual "
@@ -140,7 +164,13 @@ def main():
             "directory rather than overwriting training data")
     output.mkdir(parents=True, exist_ok=True)
 
-    data = torch.load(required["processed"], weights_only=False)
+    try:
+        data = torch.load(required["processed"], weights_only=False)
+    except EOFError as error:
+        raise RuntimeError(
+            "source processed_data.pkl is empty or incompletely written: "
+            f"{required['processed']}. Rebuild the shared source data before "
+            "preparing MA labels.") from error
     records = json.loads(required["synthetic"].read_text())
     if not data or len(data) != len(records):
         raise RuntimeError(
@@ -205,13 +235,13 @@ def main():
         }
         prepared_records.append(record)
 
-    torch.save(prepared_data, output / "processed_data.pkl")
-    (output / "synthetic_data.json").write_text(
-        json.dumps(prepared_records, indent=2) + "\n")
+    atomic_torch_save(prepared_data, output / "processed_data.pkl")
+    atomic_write_text(output / "synthetic_data.json",
+                      json.dumps(prepared_records, indent=2) + "\n")
     dataset_config = yaml.safe_load(required["dataset"].read_text())
     dataset_config["save_dir"] = str(output)
-    (output / "dataset_config.yaml").write_text(
-        yaml.safe_dump(dataset_config, sort_keys=False))
+    atomic_write_text(output / "dataset_config.yaml",
+                      yaml.safe_dump(dataset_config, sort_keys=False))
 
     source_metadata = json.loads(required["metadata"].read_text())
     source_metadata["synthetic_data_json"] = str(output / "synthetic_data.json")
@@ -236,9 +266,10 @@ def main():
         "generation_condition": ["conductivity_normalized", "anion_ratio"],
         "inference_mechanism_input": None,
     }
-    (output / "synthetic_metadata.json").write_text(
-        json.dumps(source_metadata, indent=2) + "\n")
-    (output / "mechanism_auxiliary.json").write_text(json.dumps({
+    atomic_write_text(output / "synthetic_metadata.json",
+                      json.dumps(source_metadata, indent=2) + "\n")
+    # This final sidecar acts as a completion sentinel for MA data reuse.
+    atomic_write_text(output / "mechanism_auxiliary.json", json.dumps({
         "mode": args.mode,
         "auxiliary_targets": args.auxiliary_targets,
         "source_data_dir": str(source),

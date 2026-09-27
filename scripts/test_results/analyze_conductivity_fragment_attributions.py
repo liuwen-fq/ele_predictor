@@ -1041,9 +1041,11 @@ def pair_table(rows: list[dict[str, Any]], limit: int,
 
 def plot_label_fragment(row: dict[str, Any]) -> list[str]:
     solvents = [item for item in str(row["solvent_molecules"]).split("；") if item]
-    preview = "+".join(solvents[:2])
+    # These are alternative carrier molecules, not a mixture formula.  A slash
+    # avoids implying that the two names are combined into one solvent.
+    preview = "/".join(solvents[:2])
     if len(solvents) > 2:
-        preview += "+…"
+        preview += "/…"
     return [row["fragment_group_formula"],
             f"solv: {preview} ({len(solvents)})"]
 
@@ -1055,10 +1057,12 @@ def plot_label_pair(row: dict[str, Any]) -> list[str]:
 
 
 def svg_text(x: float, y: float, value: str, size: int = 12,
-             anchor: str = "start", weight: str = "normal") -> str:
+             anchor: str = "start", weight: str = "normal",
+             fill: str | None = None) -> str:
+    fill_attribute = f' fill="{fill}"' if fill else ""
     return (f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" '
             f'font-family="Arial, sans-serif" text-anchor="{anchor}" '
-            f'font-weight="{weight}">{html.escape(value)}</text>')
+            f'font-weight="{weight}"{fill_attribute}>{html.escape(value)}</text>')
 
 
 def write_svg(path: Path, width: int, height: int, elements: list[str]) -> None:
@@ -1084,9 +1088,11 @@ def motif_profile_plot_rows(high_motifs: list[dict[str, Any]],
             if profile is None:
                 continue
             carriers = str(profile["carrier_solvents"]).split("；")
-            carrier_text = "+".join(carriers[:2])
+            # A motif may occur in several distinct solvents.  Use "/" rather
+            # than "+" so the label cannot be read as a blended solvent.
+            carrier_text = "/".join(carriers[:2])
             if len(carriers) > 2:
-                carrier_text += "+…"
+                carrier_text += "/…"
             output.append({
                 "group": group,
                 "label": f'{motif["fragment_group_formula"]} | {carrier_text}',
@@ -1139,7 +1145,8 @@ def property_profile_dot_panel(rows: list[dict[str, Any]], key: str,
 def property_effect_bar_panel(rows: list[dict[str, Any]], key: str,
                               title: str, x0: float, y0: float,
                               width: float, row_height: float,
-                              max_abs: float) -> list[str]:
+                              max_abs: float,
+                              highlight_token: str | None = None) -> list[str]:
     """Draw signed, bounded-scale direct property-attribution bars."""
 
     zero_x = x0 + width / 2
@@ -1156,13 +1163,39 @@ def property_effect_bar_panel(rows: list[dict[str, Any]], key: str,
         y = y0 + 72 + index * row_height
         bar_width = abs(value) * scale
         x = zero_x if value >= 0 else zero_x - bar_width
-        color = "#c74343" if value >= 0 else "#356ea2"
+        is_highlight = (highlight_token is not None and
+                        highlight_token in str(row["label"]))
+        # Green is reserved for a literature-supported exemplar.  It does not
+        # change the sign of the term, which remains explicit in the bar value.
+        color = "#009E73" if is_highlight else (
+            "#c74343" if value >= 0 else "#356ea2")
         lines.append(f'<rect x="{x:.1f}" y="{y - 6:.1f}" width="{bar_width:.1f}" '
                      f'height="12" fill="{color}"/>')
         lines.append(svg_text(x + bar_width + 4 if value >= 0 else x - 4,
                               y + 3, f"{value:.3f}", 8,
-                              "start" if value >= 0 else "end"))
+                              "start" if value >= 0 else "end",
+                              fill=color if is_highlight else None))
     return lines
+
+
+def property_group_labels(rows: list[dict[str, Any]], y0: float,
+                          row_height: float, width: float) -> list[str]:
+    """Add one left-side label for each contiguous conductivity group."""
+
+    high_count = sum(row["group"] == "High" for row in rows)
+    if not (0 < high_count < len(rows)):
+        return []
+    first_row_y = y0 + 72
+    separator_y = first_row_y + (high_count - 0.5) * row_height
+    high_center = first_row_y + (high_count - 1) * row_height / 2
+    low_count = len(rows) - high_count
+    low_center = first_row_y + high_count * row_height + (low_count - 1) * row_height / 2
+    return [
+        f'<line x1="15" y1="{separator_y:.1f}" x2="{width - 15}" '
+        f'y2="{separator_y:.1f}" stroke="#999" stroke-dasharray="4,3"/>',
+        svg_text(22, high_center + 4, "High", 13, "start", "bold"),
+        svg_text(22, low_center + 4, "Low", 13, "start", "bold"),
+    ]
 
 
 def make_motif_property_figures(output_dir: Path,
@@ -1203,33 +1236,61 @@ def make_motif_property_figures(output_dir: Path,
     effect_values = [abs(value) for key in ("dc_effect", "vis_effect", "Tm_effect")
                      for value in _finite_plot_values(rows, key)]
     max_abs = max(effect_values, default=0.01)
-    effect_title = [svg_text(width / 2, 22,
-                             "Signed property terms of carrier solvents by motif",
-                             16, "middle", "bold"),
-                    svg_text(16, 42,
-                             "Each bar is a normalized log-conductivity term, not a percentage.",
-                             10)]
-    effect_labels = []
-    for index, row in enumerate(rows):
-        y = y0 + 72 + index * row_height
-        effect_labels.append(svg_text(label_width - 10, y + 3,
-                                      f'{row["group"]}: {row["label"]}', 10,
-                                      "end", "bold"))
-    if 0 < high_count < len(rows):
-        separator_y = y0 + 72 + (high_count - 0.5) * row_height
-        effect_labels.append(f'<line x1="15" y1="{separator_y:.1f}" x2="{width - 15}" '
-                             f'y2="{separator_y:.1f}" stroke="#999" stroke-dasharray="4,3"/>')
-    effect_panels = [
-        property_effect_bar_panel(rows, "dc", "dc term", 470, y0, 410,
-                                  row_height, max_abs),
-        property_effect_bar_panel(rows, "vis", "vis term", 970, y0, 410,
-                                  row_height, max_abs),
-        property_effect_bar_panel(rows, "Tm", "Tm term", 1470, y0, 410,
-                                  row_height, max_abs),
-    ]
-    write_svg(output_dir / "motif_carrier_property_terms.svg", width, height,
-              effect_title + effect_labels + effect_panels[0] +
-              effect_panels[1] + effect_panels[2])
+    # One property per figure keeps the bars legible.  Use the same maximum
+    # absolute scale in all three files so their magnitudes remain comparable.
+    effect_width = 900
+    effect_groups = property_group_labels(rows, y0, row_height, effect_width)
+    for key, display_name, filename, highlight_token, highlight_note in (
+            ("dc", "dc", "motif_carrier_dc_terms.svg", "BUTY",
+             "Green: BUTY (GBL), literature-supported high-permittivity carrier."),
+            ("vis", "vis", "motif_carrier_vis_terms.svg", "AN",
+             "Green: AN, literature-supported low-viscosity carrier."),
+            ("Tm", "Tm", "motif_carrier_Tm_terms.svg", None, None)):
+        effect_labels = [
+            svg_text(label_width - 10, y0 + 72 + index * row_height + 3,
+                     row["label"], 10, "end", "bold",
+                     fill="#009E73" if (highlight_token and
+                                        highlight_token in str(row["label"]))
+                     else None)
+            for index, row in enumerate(rows)
+        ]
+        effect_title = [
+            svg_text(effect_width / 2, 22,
+                     f"Signed {display_name} term of carrier solvents by motif",
+                     16, "middle", "bold"),
+            svg_text(16, 42,
+                     highlight_note or
+                     "Normalized log-conductivity term; not a percentage.",
+                     10),
+        ]
+        effect_panel = property_effect_bar_panel(
+            rows, key, f"{display_name} term", 470, y0, 410, row_height,
+            max_abs, highlight_token)
+        write_svg(output_dir / filename, effect_width, height,
+                  effect_title + effect_labels + effect_groups + effect_panel)
+        if highlight_token:
+            # Keep a standard red/blue rendering beside the evidence-highlighted
+            # version so a reader can choose whether to see the annotation.
+            standard_labels = [
+                svg_text(label_width - 10, y0 + 72 + index * row_height + 3,
+                         row["label"], 10, "end", "bold")
+                for index, row in enumerate(rows)
+            ]
+            standard_title = [
+                svg_text(effect_width / 2, 22,
+                         f"Signed {display_name} term of carrier solvents by motif",
+                         16, "middle", "bold"),
+                svg_text(16, 42,
+                         "Normalized log-conductivity term; not a percentage.",
+                         10),
+            ]
+            standard_panel = property_effect_bar_panel(
+                rows, key, f"{display_name} term", 470, y0, 410,
+                row_height, max_abs)
+            write_svg(output_dir / filename.replace(".svg", "_standard.svg"),
+                      effect_width, height,
+                      standard_title + standard_labels + effect_groups +
+                      standard_panel)
 
 
 def make_concentration_window_figure(output_dir: Path,
@@ -1387,14 +1448,17 @@ def svg_bar_panel(rows: list[dict[str, Any]], effect_key: str, label_fn,
             lines.append(svg_text(plot_left - 9, y + 8 + line_index * 13, label,
                                   11 if line_index == 0 else 9,
                                   "end"))
-        # With two-line labels, place the bar below both text lines.  The
-        # previous offset put the bar on the first line and visually covered
-        # the ``solv:`` line.
-        bar_y = y + (30 if len(labels) > 1 else 0)
+        # Center each bar on its label block.  Labels sit entirely in the left
+        # column, so this preserves horizontal clearance while keeping every
+        # bar visually aligned with its fragment and carrier-solvent text.
+        bar_y = y + (7 if len(labels) > 1 else 0)
         lines.append(f'<rect x="{bar_x:.1f}" y="{bar_y:.1f}" width="{bar_width:.1f}" '
                      f'height="15" fill="{color}"/>')
-        lines.append(svg_text(bar_x + bar_width + 4 if value >= 0 else bar_x - 4,
-                              bar_y + 11, f"{value:.3f}", 9,
+        # Negative bars can extend into the label column.  Keep their values
+        # in a fixed column beside the zero axis rather than at the far bar
+        # end, so long negative bars never overlap fragment labels.
+        value_x = bar_x + bar_width + 4 if value >= 0 else zero_x - 4
+        lines.append(svg_text(value_x, bar_y + 11, f"{value:.3f}", 9,
                               "start" if value >= 0 else "end"))
     return lines
 
@@ -1467,18 +1531,23 @@ def make_plots(output_dir: Path, fragment_rows: list[dict[str, Any]],
                             "high_mean_interaction_normalized")
     low_pairs = candidates(pair_rows, "low", min_formulas,
                            "low_mean_interaction_normalized")
-    height = 590
-    write_svg(output_dir / "high_low_fragment_direct_contributions.svg", 1900, height,
-              svg_bar_panel(high_fragments, "high_mean_main_effect_normalized",
-                            plot_label_fragment, "High-conductivity common fragments",
-                            15, 15, 920) +
-              svg_bar_panel(low_fragments, "low_mean_main_effect_normalized",
-                            plot_label_fragment, "Low-conductivity common fragments",
-                            # Reserve a wider label area and move the low-panel
-                            # plotting area/zero axis right to prevent
-                            # horizontal overlap with long labels.
-                            965, 15, 920, zero_fraction=0.3,
-                            label_width=450))
+    # Render the high- and low-conductivity groups separately so their labels,
+    # bars, and candidate counts remain legible without a split-panel layout.
+    direct_width, direct_height = 1000, 420
+    write_svg(
+        output_dir / "high_conductivity_fragment_direct_contributions.svg",
+        direct_width, direct_height,
+        svg_bar_panel(high_fragments, "high_mean_main_effect_normalized",
+                      plot_label_fragment, "High-conductivity common fragments",
+                      15, 15, direct_width - 30, label_width=440),
+    )
+    write_svg(
+        output_dir / "low_conductivity_fragment_direct_contributions.svg",
+        direct_width, direct_height,
+        svg_bar_panel(low_fragments, "low_mean_main_effect_normalized",
+                      plot_label_fragment, "Low-conductivity common fragments",
+                      15, 15, direct_width - 30, label_width=440),
+    )
     write_svg(output_dir / "high_low_fragment_pair_interactions.svg", 1900, height,
               svg_bar_panel(high_pairs, "high_mean_interaction_normalized",
                             plot_label_pair, "High-group fragment-pair interactions",
@@ -1665,29 +1734,35 @@ def make_report(samples: list[dict[str, Any]], low_cutoff: float,
         "",
         "## 可视化",
         "",
-        "前五张图均来自本报告上方同一批、通过最小支持度筛选的候选项；第六张图来自全部全局高预测窗口。直接贡献图已按化学基元归并，第二行 `solv:` 显示前两种代表溶剂和该基元覆盖的溶剂总数；片段对图仍保留精确模型片段，以便审计交互来源。完整结构和完整溶剂清单仍以 CSV 为准。贡献/交互/物性项图中红色为正方向、蓝色为负方向；物性原值图中红蓝仅表示高/低电导率组。",
+        "前八张图均来自本报告上方同一批、通过最小支持度筛选的候选项；第九张图来自全部全局高预测窗口。直接贡献图已按化学基元归并，第二行 `solv:` 显示前两种代表溶剂和该基元覆盖的溶剂总数；`/` 表示不同的代表性溶剂，而非它们的混合物。片段对图仍保留精确模型片段，以便审计交互来源。完整结构和完整溶剂清单仍以 CSV 为准。贡献/交互/物性项图中红色为正方向、蓝色为负方向；物性原值图中红蓝仅表示高/低电导率组。",
         "",
-        "**图 1：常见结构片段的直接贡献。** 左、右面板分别对应高、低电导率组。横轴为解释头在对应组内的平均归一化 log 电导率直接贡献，条越长说明在本数据与条件范围内模型归因越强。它回答“该片段出现时，模型倾向将解释值往上还是往下推”，不能单独证明因果。",
+        "**图 1–2：常见结构片段的直接贡献。** 高、低电导率组分别作图。横轴为解释头在对应组内的平均归一化 log 电导率直接贡献，条越长说明在本数据与条件范围内模型归因越强。它回答“该片段出现时，模型倾向将解释值往上还是往下推”，不能单独证明因果。",
         "",
-        "![高低电导率组中常见片段的直接贡献](high_low_fragment_direct_contributions.svg)",
+        "![高电导率组中常见片段的直接贡献](high_conductivity_fragment_direct_contributions.svg)",
         "",
-        "**图 2：跨溶剂片段对的交互。** 左、右面板分别在高、低电导率组筛选，并按该组内平均交互绝对值排列。横轴为两个来自不同溶剂分子的片段同时出现时，超出各自直接贡献之和的平均交互项：正值为模型协同候选，负值为模型拮抗候选。交互很小或支持度很低时，只能作为后续实验组合筛选线索。",
+        "![低电导率组中常见片段的直接贡献](low_conductivity_fragment_direct_contributions.svg)",
+        "",
+        "**图 3：跨溶剂片段对的交互。** 左、右面板分别在高、低电导率组筛选，并按该组内平均交互绝对值排列。横轴为两个来自不同溶剂分子的片段同时出现时，超出各自直接贡献之和的平均交互项：正值为模型协同候选，负值为模型拮抗候选。交互很小或支持度很低时，只能作为后续实验组合筛选线索。",
         "",
         "![高低电导率组中片段对交互](high_low_fragment_pair_interactions.svg)",
         "",
-        "**图 3：富集与直接贡献的交叉判断。** 横轴为高组出现率减低组出现率：右侧表示高组富集，左侧表示低组富集；纵轴为全样本平均直接贡献：上方为正、下方为负。图中优先标注高支持度片段，此外也强制标注同时具有明显高/低组富集和强直接贡献的低频片段（如 `-C#N (AN)`）；标签使用官能团式和代表溶剂，并以引线避开相邻点。最值得优先验证的高电导率候选通常位于右上象限，低电导率待避开候选通常位于左下象限。气泡大小随独立配方支持度增加而增大。",
+        "**图 4：富集与直接贡献的交叉判断。** 横轴为高组出现率减低组出现率：右侧表示高组富集，左侧表示低组富集；纵轴为全样本平均直接贡献：上方为正、下方为负。图中优先标注高支持度片段，此外也强制标注同时具有明显高/低组富集和强直接贡献的低频片段（如 `-C#N (AN)`）；标签使用官能团式和代表溶剂，并以引线避开相邻点。最值得优先验证的高电导率候选通常位于右上象限，低电导率待避开候选通常位于左下象限。气泡大小随独立配方支持度增加而增大。",
         "",
         "![片段富集与直接贡献关系](fragment_enrichment_vs_direct_contribution.svg)",
         "",
-        "**图 4：化学基元的承载溶剂物性。** 每一行对应上方表中的一个基元—承载溶剂组合；红色为高组、蓝色为低组。三列分别在各自实际单位中显示介电常数、黏度和熔点，因此用于辨别结构候选伴随的盐解离、迁移率和低温液态范围线索；不同列的横轴独立，不能直接比较数值大小。",
+        "**图 5：化学基元的承载溶剂物性。** 每一行对应上方表中的一个基元—承载溶剂组合；红色为高组、蓝色为低组。三列分别在各自实际单位中显示介电常数、黏度和熔点，因此用于辨别结构候选伴随的盐解离、迁移率和低温液态范围线索；不同列的横轴独立，不能直接比较数值大小。",
         "",
         "![化学基元承载溶剂的物性画像](motif_carrier_solvent_property_profiles.svg)",
         "",
-        "**图 5：承载溶剂的 dc / vis / Tm 有符号物性项。** 每根条对应表内一个物性直接贡献，红色为正、蓝色为负；它们是归一化 log 电导率项而非占比。应沿同一行比较三项的方向与相对大小，而不应跨行求和。",
+        "**图 6–8：承载溶剂的 dc、vis、Tm 有符号物性项。** 三项分别作图；每根条对应表内一个物性直接贡献，红色为正、蓝色为负。各图使用相同横轴范围，因而可比较三项的相对大小；它们是归一化 log 电导率项而非占比，也不应跨行求和。左侧 High/Low 标签对应整段行，而非在每行重复标注。dc 图中的绿色 BUTY（GBL）和 vis 图中的绿色 AN 是有独立实验文献支持的示例；绿色只表示该证据标记，条的正负仍由数值判断。",
         "",
-        "![化学基元承载溶剂的物性直接贡献](motif_carrier_property_terms.svg)",
+        "![化学基元承载溶剂的 dc 直接贡献](motif_carrier_dc_terms.svg)",
         "",
-        "**图 6：全局高预测体系的浓度—电导率响应。** 每个小面板固定一个盐组成、温度邻域和溶剂比例上下文。横轴为 `salt_molar_ratio`，纵轴为该上下文中各观测浓度点的 Bamboo 主预测（mS/cm）；灰点及灰线表示全部观测浓度点及其按浓度汇总的均值，红点与浅红阴影表示最终筛出的全局高预测窗口。连线只连接观测点，不表示对中间浓度的插值。为看清各体系内部的变化趋势，每个面板采用独立纵轴，面板右上角的 `window mean` 用于跨体系比较绝对预测水平。",
+        "![化学基元承载溶剂的 vis 直接贡献](motif_carrier_vis_terms.svg)",
+        "",
+        "![化学基元承载溶剂的 Tm 直接贡献](motif_carrier_Tm_terms.svg)",
+        "",
+        "**图 9：全局高预测体系的浓度—电导率响应。** 每个小面板固定一个盐组成、温度邻域和溶剂比例上下文。横轴为 `salt_molar_ratio`，纵轴为该上下文中各观测浓度点的 Bamboo 主预测（mS/cm）；灰点及灰线表示全部观测浓度点及其按浓度汇总的均值，红点与浅红阴影表示最终筛出的全局高预测窗口。连线只连接观测点，不表示对中间浓度的插值。为看清各体系内部的变化趋势，每个面板采用独立纵轴，面板右上角的 `window mean` 用于跨体系比较绝对预测水平。",
         "",
         "![全局高预测浓度窗口](global_high_concentration_windows.svg)",
         "",

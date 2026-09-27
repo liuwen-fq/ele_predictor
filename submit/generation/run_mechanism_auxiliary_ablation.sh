@@ -20,5 +20,9 @@ case "$TARGET" in sigma|r|joint) ;; *)
   echo "Unknown MA target: $TARGET (expected sigma, r, or joint)" >&2; exit 2;; esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ "$SCOPE" == "G0" && "$TARGET" == "joint" ]]; then
+  # G0-MA is the canonical factual two-label (I_sigma, I_r) joint arm.
+  exec bash "$ROOT/submit/generation/run_mechanism_auxiliary.sh" G0-MA
+fi
 exec bash "$ROOT/submit/generation/run_mechanism_auxiliary.sh" \
   "${SCOPE}-MA-${TARGET}"
